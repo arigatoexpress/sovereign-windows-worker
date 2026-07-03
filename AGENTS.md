@@ -1,0 +1,44 @@
+# sovereign-agent-worker — charter
+
+24/7 self-driving maintenance engineer on the Windows RTX 5070 Ti box.
+Task: `sovereign-agent-worker` (S4U, boot/logon, restart×3). Code: `worker.py`. Tests: `test_worker.py`.
+
+## What it does
+1. Executes `queue\*.md` tasks: aider (codestral:22b, on-box Ollama) → task tests →
+   2-attempt failure-feedback loop → regression gate → report + git bundle in `reports\`.
+2. When idle (every 12h): regression sweep over allowlisted repos, then **backlog mining** —
+   it generates its own work from repo signals:
+   - LOW risk (auto-queued, ≤2 queued / ≤4 per day): single-file ruff-violation fixes.
+   - MEDIUM risk (→ `proposed\`, needs approval): sweep failures, TODO/FIXME resolutions.
+
+## Hard rules (by construction — do not relax)
+- Only ALLOWLIST repos (worker.py): Sapphire, telemetry-dashboard, claw-code.
+  **Project-Go-Forward (THO) is permanently excluded.**
+- Commits land on `worker/*` branches only. The worker NEVER pushes or merges —
+  this box holds no GitHub credentials on purpose.
+- No outward network actions. Local Ollama + local git only.
+- Runaway guard: any diff > 3000 lines fails the task.
+- Regression gate: diffs touching non-test files must pass the repo quick suite.
+
+## Review loop (Mac side)
+- `sov worker status | reports | show <r> | proposed | approve <t> | pull`
+- `sov worker pull` copies reports into `~/ops-state/worker-reports/` and the Knowledge
+  vault (`6-Agent-Memory/worker/` — becomes searchable institutional memory), runs
+  every 6h via launchd `com.ari.worker-sync`.
+- To land a worker branch: fetch its `.bundle` from the reports dir into a Mac clone,
+  review, push from the Mac. Example:
+  `git fetch ~/ops-state/worker-reports/<date>-<task>.bundle worker/<task>:worker/<task>`
+
+## Task file format
+```
+repo: C:\Users\aribs\Code\Sapphire
+test: python -m pytest tests/unit/test_x.py -q
+---
+Goal text for the coding agent. Multi-line is fine (keep blank line before ---? no —
+header block ends at the first line that is exactly `---`).
+```
+
+## Operations
+- Logs: `worker.log` (wrapper) + `reports\*.md` (per task/sweep) + `heartbeat.json`.
+- Restart: `schtasks /end /tn sovereign-agent-worker & schtasks /run /tn sovereign-agent-worker`
+- The worker reloads code only on restart — after editing worker.py, restart the task.
