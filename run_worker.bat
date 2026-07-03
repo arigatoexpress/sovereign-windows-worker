@@ -1,6 +1,14 @@
 @echo off
-rem sovereign windows worker — restart-forever wrapper (mirrors forecast-server pattern)
+rem sovereign windows worker — restart-forever wrapper with log rotation.
 cd /d C:\Users\aribs\agent-worker
+
+rem Rotate worker.log if it exceeds ~100 MB.
+for %%F in (worker.log) do (
+    if %%~zF GTR 104857600 (
+        move /Y worker.log worker.log.1 >nul 2>&1
+    )
+)
+
 :loop
 echo [%date% %time%] worker starting >> worker.log
 C:\Users\aribs\AppData\Local\Programs\Python\Python313\python.exe worker.py >> worker.log 2>&1

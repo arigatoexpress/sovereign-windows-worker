@@ -1,7 +1,7 @@
 # sovereign-agent-worker — charter
 
 24/7 self-driving maintenance engineer on the Windows RTX 5070 Ti box.
-Task: `sovereign-agent-worker` (S4U, boot/logon, restart×3). Code: `worker.py`. Tests: `test_worker.py`.
+Task: `sovereign-agent-worker` (S4U, boot/logon, restart×3). Code: `worker.py`. Tests: `test_worker.py` (11+ tests).
 
 ## What it does
 1. Executes `queue\*.md` tasks: aider (codestral:22b, on-box Ollama) → task tests →
@@ -39,6 +39,14 @@ header block ends at the first line that is exactly `---`).
 ```
 
 ## Operations
-- Logs: `worker.log` (wrapper) + `reports\*.md` (per task/sweep) + `heartbeat.json`.
+- Logs: `worker.log` (wrapper, auto-rotated at 100 MB) + `reports\*.md` (per task/sweep,
+  timestamped) + `heartbeat.json` + `metrics.json`.
 - Restart: `schtasks /end /tn sovereign-agent-worker & schtasks /run /tn sovereign-agent-worker`
 - The worker reloads code only on restart — after editing worker.py, restart the task.
+- Recovery: if a repo was left dirty, the worker stashes before each task and restores the
+  original branch + pops the stash in a `finally` block. Check `git stash list` if something
+  looks missing.
+
+## Environment overrides (optional)
+- `SOV_WORKER_PYTHON` — Python executable (default: `C:\Users\aribs\AppData\Local\Programs\Python\Python313\python.exe`)
+- `SOV_WORKER_AIDER` — aider executable (default: `C:\Users\aribs\.aider-venv\Scripts\aider.exe`)

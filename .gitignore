@@ -5,3 +5,13 @@ __pycache__/
 .pytest_cache/
 .vscode/
 .idea/
+worker.log
+worker.log.*
+heartbeat.json
+metrics.json
+queue/
+proposed/
+done/
+failed/
+reports/
+last-sweep.txt

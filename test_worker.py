@@ -88,3 +88,46 @@ def test_default_branch_falls_back_to_master(tmp_path):
     sp.run(["git", "add", "."], cwd=repo, check=True)
     sp.run(["git", "commit", "-m", "init"], cwd=repo, check=True)
     assert worker.default_branch(repo) == "master"
+
+
+def test_default_branch_returns_none_for_empty_repo(tmp_path):
+    import subprocess as sp
+    repo = tmp_path / "empty-repo"
+    repo.mkdir()
+    sp.run(["git", "init", "-b", "main"], cwd=repo, check=True)
+    assert worker.default_branch(repo) is None
+
+
+def test_repo_allowed_rejects_nonexistent_path():
+    assert not worker.repo_allowed(Path("C:\\Users\\aribs\\Code\\SapphireDoesNotExist"))
+
+
+def test_repo_allowed_rejects_path_traversal_prefix():
+    # A path that starts with the allowlisted prefix but is not inside it.
+    assert not worker.repo_allowed(Path("C:\\Users\\aribs\\Code\\SapphireBackup"))
+
+
+def test_report_names_include_timestamp(tmp_path, monkeypatch):
+    monkeypatch.setattr(worker, "REPORTS", tmp_path / "reports")
+    out = worker.report("demo", ["line 1"])
+    assert out.name.startswith("2")
+    assert "demo" in out.name
+
+
+def test_make_bundle_skips_empty_repo(tmp_path, monkeypatch):
+    import subprocess as sp
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sp.run(["git", "init", "-b", "main"], cwd=repo, check=True)
+    (repo / "file.txt").write_text("hello")
+    sp.run(["git", "add", "."], cwd=repo, check=True)
+    sp.run(["git", "commit", "-m", "init"], cwd=repo, check=True)
+    monkeypatch.setattr(worker, "REPORTS", tmp_path / "reports")
+    result = worker.make_bundle(repo, "empty-task")
+    assert "no commits" in result
+
+
+def test_sh_returns_timeout_code(tmp_path):
+    code, out = worker.sh(["sleep", "2"], timeout=1)
+    assert code == 124
+    assert "TIMEOUT" in out
