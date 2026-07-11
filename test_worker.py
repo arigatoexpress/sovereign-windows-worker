@@ -114,6 +114,29 @@ def test_report_names_include_timestamp(tmp_path, monkeypatch):
     assert "demo" in out.name
 
 
+def test_archive_task_moves_file(tmp_path):
+    src = tmp_path / "queue" / "task.md"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_text("x")
+    dest = worker.archive_task(src, tmp_path / "done")
+    assert dest.name == "task.md"
+    assert not src.exists()
+    assert dest.exists()
+
+
+def test_archive_task_avoids_name_collision(tmp_path):
+    src = tmp_path / "queue" / "task.md"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_text("x")
+    done_dir = tmp_path / "done"
+    done_dir.mkdir(parents=True, exist_ok=True)
+    (done_dir / "task.md").write_text("old")
+    dest = worker.archive_task(src, done_dir)
+    assert dest.name == "task-1.md"
+    assert not src.exists()
+    assert dest.exists()
+
+
 def test_make_bundle_skips_empty_repo(tmp_path, monkeypatch):
     import subprocess as sp
     repo = tmp_path / "repo"
@@ -131,3 +154,80 @@ def test_sh_returns_timeout_code(tmp_path):
     code, out = worker.sh(["sleep", "2"], timeout=1)
     assert code == 124
     assert "TIMEOUT" in out
+
+
+def test_parse_task_detects_analysis_only_prefix(tmp_path):
+    f = tmp_path / "analysis.md"
+    f.write_text("repo: C:\\Users\\aribs\\Code\\Sapphire\ntest: \n---\nANALYSIS ONLY: review this.\n")
+    t = worker.parse_task(f)
+    assert t["analysis_only"] is True
+
+
+def test_parse_task_detects_analysis_only_phrase(tmp_path):
+    f = tmp_path / "analysis.md"
+    f.write_text("repo: C:\\Users\\aribs\\Code\\Sapphire\ntest: \n---\nPlease investigate but do not modify any files.\n")
+    t = worker.parse_task(f)
+    assert t["analysis_only"] is True
+
+
+def test_parse_task_regular_not_analysis_only(tmp_path):
+    f = tmp_path / "regular.md"
+    f.write_text("repo: C:\\Users\\aribs\\Code\\Sapphire\ntest: \n---\nFix the bug.\n")
+    t = worker.parse_task(f)
+    assert t["analysis_only"] is False
+
+
+def _make_run_task_mocks(monkeypatch, tmp_path):
+    """Stub the heavy collaborators so run_task can be unit-tested in isolation."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setattr(worker, "repo_allowed", lambda p: True)
+    monkeypatch.setattr(worker, "default_branch", lambda p: "main")
+    monkeypatch.setattr(worker, "diff_lines", lambda p, base=None: 0)
+    monkeypatch.setattr(worker, "commits_made", lambda p, base=None: 0)
+    monkeypatch.setattr(worker, "changed_source_files", lambda p, base=None: [])
+    monkeypatch.setattr(worker, "make_bundle", lambda p, name, base=None: "no commits to bundle")
+    monkeypatch.setattr(worker, "_cleanup_repo", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker, "heartbeat", lambda state, detail="": None)
+
+    def fake_sh(cmd, cwd=None, timeout=600):
+        if isinstance(cmd, list) and len(cmd) > 2 and cmd[0] == "git":
+            return 0, ""
+        if isinstance(cmd, list) and "aider" in str(cmd[0]).lower():
+            return 0, "done"
+        return 0, ""
+
+    monkeypatch.setattr(worker, "sh", fake_sh)
+    return repo
+
+
+def test_analysis_only_task_passes_with_zero_commits(tmp_path, monkeypatch):
+    repo = _make_run_task_mocks(monkeypatch, tmp_path)
+    task_file = tmp_path / "analysis.md"
+    task_file.write_text(f"repo: {repo}\ntest: \n---\nANALYSIS ONLY: review code.\n")
+    task = worker.parse_task(task_file)
+    assert task["analysis_only"] is True
+
+    reports = []
+    monkeypatch.setattr(worker, "report", lambda name, lines: reports.append((name, lines)) or tmp_path / "report.md")
+
+    assert worker.run_task(task) is True
+    # Verify the report explains it passed without the no-op guard tripping.
+    report_lines = "\n".join(reports[-1][1])
+    assert "RESULT: PASS" in report_lines
+
+
+def test_regular_task_fails_with_zero_commits(tmp_path, monkeypatch):
+    repo = _make_run_task_mocks(monkeypatch, tmp_path)
+    task_file = tmp_path / "regular.md"
+    task_file.write_text(f"repo: {repo}\ntest: \n---\nFix the bug.\n")
+    task = worker.parse_task(task_file)
+    assert task["analysis_only"] is False
+
+    reports = []
+    monkeypatch.setattr(worker, "report", lambda name, lines: reports.append((name, lines)) or tmp_path / "report.md")
+
+    assert worker.run_task(task) is False
+    report_lines = "\n".join(reports[-1][1])
+    assert "NO-OP GUARD" in report_lines
+    assert "RESULT: FAIL" in report_lines
