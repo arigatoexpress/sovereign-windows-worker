@@ -99,7 +99,17 @@ def parse_task(path: Path) -> dict | None:
     goal = body.strip()
     if not repo or not goal:
         return None
-    return {"name": path.stem, "repo": Path(repo), "test": fields.get("test", ""), "goal": goal}
+    analysis_only = (
+        goal.upper().startswith("ANALYSIS ONLY")
+        or "do not modify any files" in goal.lower()
+    )
+    return {
+        "name": path.stem,
+        "repo": Path(repo),
+        "test": fields.get("test", ""),
+        "goal": goal,
+        "analysis_only": analysis_only,
+    }
 
 
 def repo_allowed(repo: Path) -> bool:
@@ -197,12 +207,42 @@ def save_metrics(m: dict) -> None:
     tmp.replace(METRICS)
 
 
+def update_metrics(
+    *, increment: tuple[str, ...] = (), values: dict | None = None
+) -> dict:
+    """Reload, mutate, and persist metrics so live operator resets are honored."""
+    metrics = load_metrics()
+    for key in increment:
+        metrics[key] = int(metrics.get(key, 0)) + 1
+    if values:
+        metrics.update(values)
+    save_metrics(metrics)
+    return metrics
+
+
 def report(name: str, lines: list[str]) -> Path:
     REPORTS.mkdir(parents=True, exist_ok=True)
     ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     out = REPORTS / f"{dt.date.today().isoformat()}-{name}-{ts}.md"
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return out
+
+
+def archive_task(path: Path, dest_dir: Path) -> Path:
+    """Move a task file into dest_dir, suffixing the name if a file already exists.
+
+    Path.rename() raises FileExistsError on Windows when the destination exists,
+    which crashed the main loop when a task was re-queued with the same stem.
+    """
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / path.name
+    counter = 1
+    stem, suffix = path.stem, path.suffix
+    while dest.exists():
+        dest = dest_dir / f"{stem}-{counter}{suffix}"
+        counter += 1
+    path.rename(dest)
+    return dest
 
 
 # ── v2: guards ────────────────────────────────────────────────────────────────
@@ -272,6 +312,7 @@ def _cleanup_repo(repo: Path, base: str | None, branch: str, stash_ref: str | No
 
 def run_task(task: dict) -> bool:
     name, repo, goal, test = task["name"], task["repo"], task["goal"], task["test"]
+    analysis_only = task.get("analysis_only", False)
     lines = [f"# worker task: {name}", f"- started: {now()}", f"- repo: {repo}",
              f"- goal: {goal[:300]}"]
 
@@ -335,7 +376,8 @@ def run_task(task: dict) -> bool:
                 break
 
         # No-op guard: a "PASS" with zero commits means the agent changed nothing.
-        if ok and commits_made(repo, base) == 0:
+        # Analysis-only tasks are explicitly allowed (and expected) to produce no commits.
+        if ok and not analysis_only and commits_made(repo, base) == 0:
             lines += ["", "NO-OP GUARD: task tests pass but the agent produced no commits — marking FAIL."]
             ok = False
 
@@ -470,7 +512,6 @@ def main() -> None:
     for d in (QUEUE, PROPOSED, DONE, FAILED, REPORTS):
         d.mkdir(parents=True, exist_ok=True)
     heartbeat("start")
-    metrics = load_metrics()
     while True:
         try:
             tasks = sorted(QUEUE.glob("*.md"), key=lambda p: p.stat().st_mtime)
@@ -480,24 +521,20 @@ def main() -> None:
                 if task is None:
                     report(path.stem, [f"# malformed task {path.name}",
                                        "missing 'repo:' header or '---' separator"])
-                    path.rename(FAILED / path.name)
+                    archive_task(path, FAILED)
                     continue
                 ok = run_task(task)
-                metrics["tasks"] += 1
-                metrics["pass" if ok else "fail"] += 1
-                save_metrics(metrics)
-                path.rename((DONE if ok else FAILED) / path.name)
+                update_metrics(increment=("tasks", "pass" if ok else "fail"))
+                archive_task(path, DONE if ok else FAILED)
                 heartbeat("idle", f"finished {path.stem}: {'PASS' if ok else 'FAIL'}")
             else:
                 sweep()
-                metrics["last_sweep"] = now()
-                save_metrics(metrics)
+                update_metrics(values={"last_sweep": now()})
                 heartbeat("idle")
                 time.sleep(POLL_S)
         except subprocess.TimeoutExpired:
             # Count aider timeouts via the sh() return code; this catches unexpected loops.
-            metrics["timeouts"] += 1
-            save_metrics(metrics)
+            update_metrics(increment=("timeouts",))
             heartbeat("error", "timeout in main loop")
             time.sleep(POLL_S)
         except Exception as e:
