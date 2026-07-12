@@ -114,6 +114,29 @@ def test_report_names_include_timestamp(tmp_path, monkeypatch):
     assert "demo" in out.name
 
 
+def test_update_metrics_honors_external_reset(tmp_path, monkeypatch):
+    metrics_path = tmp_path / "metrics.json"
+    monkeypatch.setattr(worker, "METRICS", metrics_path)
+    worker.save_metrics(
+        {"tasks": 47, "pass": 1, "fail": 46, "timeouts": 0, "last_sweep": "old"}
+    )
+
+    # An operator resets counters while the worker process remains alive.
+    worker.save_metrics(
+        {"tasks": 0, "pass": 0, "fail": 0, "timeouts": 0, "last_sweep": ""}
+    )
+    updated = worker.update_metrics(increment=("tasks", "pass"))
+
+    assert updated == {
+        "tasks": 1,
+        "pass": 1,
+        "fail": 0,
+        "timeouts": 0,
+        "last_sweep": "",
+    }
+    assert worker.load_metrics() == updated
+
+
 def test_archive_task_moves_file(tmp_path):
     src = tmp_path / "queue" / "task.md"
     src.parent.mkdir(parents=True, exist_ok=True)

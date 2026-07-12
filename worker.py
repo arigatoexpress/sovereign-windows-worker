@@ -207,6 +207,19 @@ def save_metrics(m: dict) -> None:
     tmp.replace(METRICS)
 
 
+def update_metrics(
+    *, increment: tuple[str, ...] = (), values: dict | None = None
+) -> dict:
+    """Reload, mutate, and persist metrics so live operator resets are honored."""
+    metrics = load_metrics()
+    for key in increment:
+        metrics[key] = int(metrics.get(key, 0)) + 1
+    if values:
+        metrics.update(values)
+    save_metrics(metrics)
+    return metrics
+
+
 def report(name: str, lines: list[str]) -> Path:
     REPORTS.mkdir(parents=True, exist_ok=True)
     ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -499,7 +512,6 @@ def main() -> None:
     for d in (QUEUE, PROPOSED, DONE, FAILED, REPORTS):
         d.mkdir(parents=True, exist_ok=True)
     heartbeat("start")
-    metrics = load_metrics()
     while True:
         try:
             tasks = sorted(QUEUE.glob("*.md"), key=lambda p: p.stat().st_mtime)
@@ -512,21 +524,17 @@ def main() -> None:
                     archive_task(path, FAILED)
                     continue
                 ok = run_task(task)
-                metrics["tasks"] += 1
-                metrics["pass" if ok else "fail"] += 1
-                save_metrics(metrics)
+                update_metrics(increment=("tasks", "pass" if ok else "fail"))
                 archive_task(path, DONE if ok else FAILED)
                 heartbeat("idle", f"finished {path.stem}: {'PASS' if ok else 'FAIL'}")
             else:
                 sweep()
-                metrics["last_sweep"] = now()
-                save_metrics(metrics)
+                update_metrics(values={"last_sweep": now()})
                 heartbeat("idle")
                 time.sleep(POLL_S)
         except subprocess.TimeoutExpired:
             # Count aider timeouts via the sh() return code; this catches unexpected loops.
-            metrics["timeouts"] += 1
-            save_metrics(metrics)
+            update_metrics(increment=("timeouts",))
             heartbeat("error", "timeout in main loop")
             time.sleep(POLL_S)
         except Exception as e:
