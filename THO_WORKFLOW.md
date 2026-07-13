@@ -25,6 +25,10 @@ verifies it with `git bundle verify`, and writes a task carrying `source`, `mess
 `message_date`, `base_sha`, `base_bundle`, and the mandatory test command. It does not
 fetch Gmail, use the network, modify the source clone, or send a reply.
 
+The test command must be a shell-free, repo-local Python pytest or npm test invocation.
+Shell chaining, redirection, substitution, external executables, absolute paths, and
+parent-directory traversal are rejected during staging and again on the worker.
+
 ## 2. Transfer the two artifacts
 
 Copy the generated `.bundle` into the Windows worker's
@@ -34,12 +38,13 @@ bundle by basename, which the worker resolves only beneath `incoming-bundles`.
 
 ## 3. Build only in the isolated workspace
 
-The Windows worker verifies the provenance and bundle again, clones the bundle into
-`agent-worker\tho-workspaces\<task>-<sha>`, and checks out the exact recorded SHA before
-creating a `worker/*` branch. It rejects missing or mismatched provenance, traversal,
-stale SHAs, prohibited paths, diffs over 500 lines, missing tests, failing task tests,
-and failing canonical regressions for source changes. It creates and verifies the result
-bundle before deleting only that generated workspace.
+The Windows worker verifies the provenance and bundle again, requires `base_sha` to equal
+the bundle-advertised `refs/remotes/origin/main` head, fetches that exact ref into
+`agent-worker\tho-workspaces\<task>-<sha>`, and checks out the recorded SHA before creating
+a `worker/*` branch. It rejects missing or mismatched provenance, traversal, stale or
+ancestor SHAs, prohibited paths (including both sides of renames), diffs over 500 lines,
+missing tests, failing task tests, and failing canonical regressions for source changes.
+It creates and verifies the result bundle before deleting only that generated workspace.
 
 The worker never stashes, switches, cleans, or edits the existing Windows
 `Project-Go-Forward` clone. It never pushes, merges, deploys, changes DNS, reads Gmail,

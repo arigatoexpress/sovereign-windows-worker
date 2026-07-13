@@ -11,6 +11,8 @@ import re
 import subprocess
 from pathlib import Path
 
+from worker import parse_tho_test_command
+
 
 def _git(repo: Path, *args: str) -> str:
     completed = subprocess.run(
@@ -40,6 +42,7 @@ def stage_request(
         raise ValueError("repo and normalized request file must exist")
     if not message_id.strip() or not message_date.strip() or not test.strip():
         raise ValueError("message_id, message_date, and test are required")
+    parse_tho_test_command(test)
     goal = request_file.read_text(encoding="utf-8").strip()
     if not goal:
         raise ValueError("normalized request must not be empty")
