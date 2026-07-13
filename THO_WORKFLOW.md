@@ -1,0 +1,69 @@
+# THO explicit-request workflow
+
+This is an explicit-request lane, not autonomous THO access. `Project-Go-Forward`
+remains outside `ALLOWLIST`, backlog mining, and regression sweeps. The stale or dirty
+Windows clone is never used by this workflow.
+
+## 1. Normalize and stage on the Mac
+
+Search/read Gmail on the Mac or in the connected cloud environment. Copy only Mark's
+requested work into a local UTF-8 text file; do not put Gmail credentials or raw mailbox
+access on the Windows worker. Refresh and inspect the Mac clone's `origin/main`, then run:
+
+```sh
+python3 stage_tho_request.py \
+  --repo /path/to/Project-Go-Forward \
+  --request-file /path/to/normalized-request.txt \
+  --message-id '<gmail-message-id>' \
+  --message-date 'YYYY-MM-DD' \
+  --test 'python -m pytest path/to/explicit_test.py -q' \
+  --output-dir /path/to/staged
+```
+
+The script resolves the exact `origin/main` SHA, creates a full Git bundle for that ref,
+verifies it with `git bundle verify`, and writes a task carrying `source`, `message_id`,
+`message_date`, `base_sha`, `base_bundle`, and the mandatory test command. It does not
+fetch Gmail, use the network, modify the source clone, or send a reply.
+
+The test command must be a shell-free, repo-local Python pytest or npm test invocation.
+Shell chaining, redirection, substitution, external executables, absolute paths, and
+parent-directory traversal are rejected during staging and again on the worker.
+Every staging header is single-line, the message date is a real calendar date in exact
+`YYYY-MM-DD` form, and the worker repository header is fixed to
+`C:\Users\aribs\Code\Project-Go-Forward`.
+
+## 2. Transfer the two artifacts
+
+Copy the generated `.bundle` into the Windows worker's
+`agent-worker\incoming-bundles\` directory. Copy the generated `.md` task into
+`agent-worker\queue\`. Keep the generated filenames unchanged: the task refers to the
+bundle by basename, which the worker resolves only beneath `incoming-bundles`.
+
+## 3. Build only in the isolated workspace
+
+The Windows worker verifies the provenance and bundle again, requires `base_sha` to equal
+the bundle-advertised `refs/remotes/origin/main` head, fetches that exact ref into
+`agent-worker\tho-workspaces\<task>-<sha>`, and checks out the recorded SHA before creating
+a `worker/*` branch. It rejects missing or mismatched provenance, traversal, stale or
+ancestor SHAs, prohibited paths (including both sides of renames), diffs over 500 lines,
+missing tests, failing task tests, and failing canonical regressions for source changes.
+It creates and verifies the result bundle before deleting only that generated workspace.
+
+Task tests and the canonical suite are read-only verification steps: the worker records
+the post-aider commit and rejects any test process that changes HEAD or leaves working-tree
+changes. Immediately before bundle creation it repeats the clean-tree, 500-line, protected-
+path, and tested-HEAD checks. The canonical suite runs as fixed argv through the configured
+worker Python executable, never through a shell. Workspace deletion is verified; a Windows
+file-lock or any other cleanup failure is reported with its exact path/error and forces the
+final result to FAIL.
+
+The worker never stashes, switches, cleans, or edits the existing Windows
+`Project-Go-Forward` clone. It never pushes, merges, deploys, changes DNS, reads Gmail,
+or sends email.
+
+## 4. Review and land from the Mac
+
+Pull the report and result bundle to the Mac. Verify the bundle, fetch it into a Mac THO
+clone, inspect the full diff and test evidence, and handle any push, PR, and merge from
+the Mac under the normal THO gates. Any email response remains a draft until Ari gives
+explicit approval to send it.

@@ -35,9 +35,12 @@ import datetime as dt
 import json
 import os
 import re
+import shlex
+import shutil
 import subprocess
+import tempfile
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 HOME = Path.home()
 BASE = HOME / "agent-worker"
@@ -74,6 +77,13 @@ MAX_DIFF_LINES = 3000
 MAX_AUTO_QUEUED = 2
 MAX_AUTO_PER_DAY = 4
 MAX_PROPOSED = 12
+THO_SOURCE = "gmail-mark-tho"
+THO_MAX_DIFF_LINES = 500
+THO_CANONICAL_TESTS = (
+    "tests/test_healthz.py",
+    "tests/test_api_v1.py",
+    "tests/test_document_engine.py",
+)
 
 
 def now() -> str:
@@ -109,6 +119,11 @@ def parse_task(path: Path) -> dict | None:
         "test": fields.get("test", ""),
         "goal": goal,
         "analysis_only": analysis_only,
+        "source": fields.get("source", ""),
+        "message_id": fields.get("message_id", ""),
+        "message_date": fields.get("message_date", ""),
+        "base_sha": fields.get("base_sha", ""),
+        "base_bundle": fields.get("base_bundle", ""),
     }
 
 
@@ -123,6 +138,224 @@ def repo_allowed(repo: Path) -> bool:
         r == a.resolve() or r.is_relative_to(a.resolve())
         for a in ALLOWLIST if a.exists()
     )
+
+
+def is_tho_task(task: dict) -> bool:
+    """Return whether this is an explicit THO request, never a generic repo task."""
+    repo_name = str(task.get("repo", "")).replace("\\", "/").rstrip("/").split("/")[-1]
+    return task.get("source") == THO_SOURCE and repo_name == "Project-Go-Forward"
+
+
+def _tho_bundle_path(task: dict) -> Path:
+    incoming = (BASE / "incoming-bundles").resolve()
+    supplied = Path(str(task.get("base_bundle", "")))
+    return (incoming / supplied).resolve() if not supplied.is_absolute() else supplied.resolve()
+
+
+def _verify_bundle(bundle: Path) -> tuple[bool, str]:
+    """Run git's full bundle verification in a disposable empty repository."""
+    workspaces = BASE / "tho-workspaces"
+    workspaces.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="verify-", dir=workspaces) as temp:
+        verifier = Path(temp)
+        code, out = sh(["git", "init", "--bare", str(verifier)], timeout=60)
+        if code != 0:
+            return False, f"could not initialize bundle verifier: {out[-200:]}"
+        code, out = sh(["git", "-C", str(verifier), "bundle", "verify", str(bundle)], timeout=120)
+        return code == 0, out
+
+
+def _bundle_origin_main_head(bundle: Path) -> tuple[str | None, str]:
+    code, out = sh(
+        ["git", "bundle", "list-heads", str(bundle), "refs/remotes/origin/main"],
+        timeout=120,
+    )
+    if code != 0:
+        return None, out
+    lines = [line.split() for line in out.splitlines() if line.strip()]
+    if len(lines) != 1 or len(lines[0]) != 2 or lines[0][1] != "refs/remotes/origin/main":
+        return None, "bundle must advertise exactly refs/remotes/origin/main"
+    return lines[0][0], ""
+
+
+def parse_tho_test_command(command: str) -> list[str]:
+    """Constrain THO tests to shell-free, repo-local pytest or npm invocations."""
+    command = command.strip()
+    if not command:
+        raise ValueError("test command is required")
+    if re.search(r"[;&|<>`$^\r\n]", command) or re.search(r"%[^%]+%", command):
+        raise ValueError("test command contains shell metacharacters or substitution")
+    if re.search(r"(?:^|\s)(?:[A-Za-z]:[\\/]|\\\\|//)", command):
+        raise ValueError("test command contains an absolute Windows path")
+    try:
+        argv = shlex.split(command, posix=True)
+    except ValueError as exc:
+        raise ValueError(f"invalid test command quoting: {exc}") from exc
+    if not argv:
+        raise ValueError("test command is required")
+
+    executable = argv[0].lower()
+    if "/" in executable or "\\" in executable:
+        raise ValueError("test executable must be resolved from PATH")
+    python_commands = {"python", "python3", "python.exe", "python3.exe", "py", "py.exe"}
+    pytest_commands = {"pytest", "pytest.exe"}
+    npm_commands = {"npm", "npm.cmd"}
+    if executable in python_commands:
+        if len(argv) < 3 or argv[1:3] != ["-m", "pytest"]:
+            raise ValueError("Python THO tests must use 'python -m pytest'")
+    elif executable in pytest_commands:
+        pass
+    elif executable in npm_commands:
+        if len(argv) < 2 or argv[1] not in {"test", "run"}:
+            raise ValueError("npm THO tests must use 'npm test' or 'npm run test*'")
+        if argv[1] == "run" and (len(argv) < 3 or not argv[2].lower().startswith("test")):
+            raise ValueError("npm run script must start with 'test'")
+    else:
+        raise ValueError("test executable must be Python pytest or npm")
+
+    for token in argv[1:]:
+        candidate = token.split("=", 1)[-1] if "=" in token else token
+        if "://" in candidate:
+            raise ValueError("test arguments must not reference external URLs")
+        if (PurePosixPath(candidate).is_absolute()
+                or PureWindowsPath(candidate).is_absolute()
+                or ".." in PurePosixPath(candidate.replace("\\", "/")).parts
+                or candidate.startswith("~")):
+            raise ValueError("test arguments must use repo-local paths")
+    return argv
+
+
+def validate_tho_task(task: dict) -> tuple[bool, str]:
+    """Validate provenance and the contained, complete Git bundle for a THO task."""
+    if not is_tho_task(task):
+        return False, f"source must be exactly {THO_SOURCE} for Project-Go-Forward"
+    for field in ("message_id", "message_date", "test"):
+        if not str(task.get(field, "")).strip():
+            return False, f"missing required {field}"
+    sha = str(task.get("base_sha", ""))
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        return False, "base_sha must be exactly 40 lowercase hexadecimal characters"
+    raw_bundle = str(task.get("base_bundle", "")).strip()
+    if not raw_bundle:
+        return False, "missing required base_bundle"
+    bundle = _tho_bundle_path(task)
+    incoming = (BASE / "incoming-bundles").resolve()
+    if not bundle.is_relative_to(incoming):
+        return False, "base_bundle must resolve beneath incoming-bundles"
+    if bundle.suffix.lower() != ".bundle" or not bundle.is_file():
+        return False, "base_bundle must be an existing .bundle file"
+    try:
+        parse_tho_test_command(str(task["test"]))
+    except ValueError as exc:
+        return False, f"unsafe test command: {exc}"
+    verified, output = _verify_bundle(bundle)
+    if not verified:
+        return False, f"git bundle verify failed: {output[-200:]}"
+    advertised_sha, output = _bundle_origin_main_head(bundle)
+    if advertised_sha is None:
+        return False, output
+    if advertised_sha != sha:
+        return False, "base_sha must equal the bundle-advertised origin/main head"
+    return True, ""
+
+
+def prepare_tho_workspace(task: dict) -> Path:
+    """Clone a verified THO bundle and detach at the exact provenance SHA."""
+    valid, reason = validate_tho_task(task)
+    if not valid:
+        raise ValueError(reason)
+    sha = task["base_sha"]
+    parent = BASE / "tho-workspaces"
+    parent.mkdir(parents=True, exist_ok=True)
+    workspace = parent / f"{slug(task['name'])}-{sha[:12]}"
+    if workspace.exists():
+        raise ValueError(f"THO workspace already exists: {workspace}")
+    try:
+        workspace.mkdir()
+        code, out = sh(["git", "-C", str(workspace), "init"], timeout=120)
+        if code != 0:
+            raise ValueError(f"workspace init failed: {out[-300:]}")
+        code, out = sh(
+            ["git", "-C", str(workspace), "fetch", str(_tho_bundle_path(task)),
+             "refs/remotes/origin/main:refs/remotes/origin/main"], timeout=300,
+        )
+        if code != 0:
+            raise ValueError(f"bundle fetch failed: {out[-300:]}")
+        code, out = sh(["git", "-C", str(workspace), "checkout", "--detach", sha], timeout=120)
+        if code != 0:
+            raise ValueError(f"base_sha is absent or stale for bundle: {out[-300:]}")
+        code, head = sh(["git", "-C", str(workspace), "rev-parse", "HEAD"], timeout=60)
+        if code != 0 or head.strip() != sha:
+            raise ValueError("workspace HEAD does not equal the supplied base_sha")
+        return workspace
+    except Exception as original:
+        try:
+            shutil.rmtree(workspace)
+        except Exception as cleanup_error:
+            raise RuntimeError(
+                f"workspace preparation failed ({original}); cleanup failed for "
+                f"{workspace}: {cleanup_error}"
+            ) from cleanup_error
+        if workspace.exists():
+            raise RuntimeError(
+                f"workspace preparation failed ({original}); cleanup left {workspace} present"
+            ) from original
+        raise
+
+
+def validate_tho_changed_paths(repo: Path, base: str) -> tuple[bool, list[str]]:
+    """Reject client documents, automation, env files, and credential-like paths."""
+    code, out = sh(
+        ["git", "-C", str(repo), "diff", "--no-renames", "--name-only", base], timeout=120,
+    )
+    if code != 0:
+        return False, ["<unable to enumerate changed paths>"]
+    code_u, untracked = sh(
+        ["git", "-C", str(repo), "ls-files", "--others", "--exclude-standard"], timeout=120,
+    )
+    if code_u != 0:
+        return False, ["<unable to enumerate untracked paths>"]
+    rejected: list[str] = []
+    changed = dict.fromkeys(out.splitlines() + untracked.splitlines())
+    for raw in filter(None, (line.strip() for line in changed)):
+        normalized = raw.replace("\\", "/")
+        lower = normalized.lower()
+        parts = Path(normalized).parts
+        unsafe_shape = Path(normalized).is_absolute() or ".." in parts
+        filename = Path(lower).name
+        prohibited = (
+            filename == ".env" or filename.startswith(".env.")
+            or lower.startswith("tho_documents/")
+            or lower.startswith(".github/workflows/")
+            or any(token in lower for token in ("credential", "service-account", "id_rsa", "id_ed25519"))
+            or Path(lower).suffix in {".pem", ".key", ".p12", ".pfx"}
+        )
+        if unsafe_shape or prohibited:
+            rejected.append(raw)
+    return not rejected, rejected
+
+
+def _tho_diff_lines(repo: Path, base: str) -> int:
+    """Count committed, working-tree, and untracked THO changes from the exact SHA."""
+    code, out = sh(["git", "-C", str(repo), "diff", "--numstat", base], timeout=120)
+    if code != 0:
+        return THO_MAX_DIFF_LINES + 1
+    total = 0
+    for line in out.splitlines():
+        columns = line.split("\t", 2)
+        for count in columns[:2]:
+            total += int(count) if count.isdigit() else THO_MAX_DIFF_LINES + 1
+    code, untracked = sh(
+        ["git", "-C", str(repo), "ls-files", "--others", "--exclude-standard"], timeout=120,
+    )
+    if code != 0:
+        return THO_MAX_DIFF_LINES + 1
+    for relative in untracked.splitlines():
+        try:
+            total += len((repo / relative).read_bytes().splitlines())
+        except OSError:
+            return THO_MAX_DIFF_LINES + 1
+    return total
 
 
 def default_branch(repo: Path) -> str | None:
@@ -310,7 +543,175 @@ def _cleanup_repo(repo: Path, base: str | None, branch: str, stash_ref: str | No
             pass
 
 
+def _tho_head(repo: Path) -> tuple[str | None, str]:
+    code, out = sh(["git", "-C", str(repo), "rev-parse", "HEAD"], timeout=60)
+    return (out.strip(), "") if code == 0 else (None, out[-300:])
+
+
+def _tho_clean_tree(repo: Path) -> tuple[bool, str]:
+    code, out = sh(["git", "-C", str(repo), "status", "--porcelain"], timeout=60)
+    if code != 0:
+        return False, f"git status failed: {out[-300:]}"
+    if out.strip():
+        return False, out.strip()[:500]
+    return True, ""
+
+
+def _tho_final_artifact_guard(repo: Path, base: str, expected_head: str) -> tuple[bool, str]:
+    head, error = _tho_head(repo)
+    if head is None:
+        return False, f"could not read final HEAD: {error}"
+    if head != expected_head:
+        return False, f"final HEAD changed from tested {expected_head} to {head}"
+    clean, detail = _tho_clean_tree(repo)
+    if not clean:
+        return False, f"final working tree is not clean: {detail}"
+    n_diff = _tho_diff_lines(repo, base)
+    if n_diff > THO_MAX_DIFF_LINES:
+        return False, f"final diff is {n_diff} lines (> {THO_MAX_DIFF_LINES})"
+    paths_ok, rejected = validate_tho_changed_paths(repo, base)
+    if not paths_ok:
+        return False, "final prohibited paths: " + ", ".join(rejected)
+    return True, ""
+
+
+def _run_tho_task(task: dict) -> bool:
+    """Execute an explicit THO request only inside its disposable bundle clone."""
+    name, goal, test = task["name"], task["goal"], task["test"]
+    lines = [f"# worker task: {name}", f"- started: {now()}",
+             f"- repo: {task['repo']}", f"- source: {task.get('source', '')}",
+             f"- message-id: {task.get('message_id', '')}", f"- goal: {goal[:300]}"]
+    valid, reason = validate_tho_task(task)
+    if not valid:
+        lines += ["", f"REJECTED: invalid THO provenance — {reason}"]
+        report(name, lines)
+        return False
+    test_argv = parse_tho_test_command(test)
+
+    workspace: Path | None = None
+    branch = f"worker/{slug(name)}"
+    base = task["base_sha"]
+    ok = False
+    test_out = ""
+    tested_head: str | None = None
+    bundle = "not created: task failed safety gates"
+    try:
+        workspace = prepare_tho_workspace(task)
+        _heartbeat_state.update(task=name, repo=str(workspace), branch=branch)
+        code, out = sh(["git", "-C", str(workspace), "switch", "-C", branch, base], timeout=120)
+        if code != 0:
+            raise RuntimeError(f"could not create worker branch: {out[-300:]}")
+        lines.append(f"- isolated workspace: {workspace}")
+        lines.append(f"- branch: {branch} from exact SHA {base}")
+
+        for attempt in (1, 2):
+            heartbeat("task", f"{name} THO attempt {attempt}")
+            message = goal if attempt == 1 else (
+                goal + "\n\nThe previous attempt failed these tests — fix the failures:\n"
+                + test_out[-3000:]
+            )
+            code, out = sh(
+                [str(AIDER), "--model", MODEL, "--weak-model", WEAK_MODEL,
+                 "--no-show-model-warnings", "--yes-always", "--no-stream",
+                 "--map-tokens", "1024", "--map-refresh", "manual",
+                 "--auto-commits", "--message", message],
+                cwd=workspace, timeout=TASK_TIMEOUT_S,
+            )
+            lines += ["", f"## aider attempt {attempt} (rc={code})", "```", out[-2500:], "```"]
+
+            n_diff = _tho_diff_lines(workspace, base)
+            if n_diff > THO_MAX_DIFF_LINES:
+                lines += ["", f"THO RUNAWAY GUARD: diff is {n_diff} lines (> {THO_MAX_DIFF_LINES})."]
+                break
+            paths_ok, rejected = validate_tho_changed_paths(workspace, base)
+            if not paths_ok:
+                lines += ["", "THO PATH GUARD rejected: " + ", ".join(rejected)]
+                break
+            clean, detail = _tho_clean_tree(workspace)
+            if not clean:
+                lines += ["", f"THO CLEAN-TREE GUARD before task tests: {detail}"]
+                break
+            expected_head, head_error = _tho_head(workspace)
+            if expected_head is None:
+                lines += ["", f"THO HEAD GUARD before task tests: {head_error}"]
+                break
+            code_t, test_out = sh(test_argv, cwd=workspace, timeout=TEST_TIMEOUT_S)
+            lines += [f"## tests attempt {attempt} (rc={code_t})", "```", test_out[-2000:], "```"]
+            after_head, head_error = _tho_head(workspace)
+            if after_head is None or after_head != expected_head:
+                lines += ["", "THO TEST ARTIFACT GUARD: task tests changed HEAD "
+                          f"from {expected_head} to {after_head or head_error}."]
+                break
+            clean, detail = _tho_clean_tree(workspace)
+            if not clean:
+                lines += ["", f"THO TEST ARTIFACT GUARD: task tests left changes: {detail}"]
+                break
+            if code_t == 0:
+                ok = True
+                tested_head = expected_head
+                break
+
+        if ok and commits_made(workspace, base) == 0:
+            lines += ["", "NO-OP GUARD: task tests pass but the agent produced no commits — marking FAIL."]
+            ok = False
+
+        if ok and changed_source_files(workspace, base):
+            heartbeat("task", f"{name} THO canonical regression gate")
+            canonical_argv = [str(PYTHON), "-m", "pytest", *THO_CANONICAL_TESTS, "-q"]
+            expected_head = tested_head
+            code_g, gate_out = sh(canonical_argv, cwd=workspace, timeout=TEST_TIMEOUT_S)
+            tail = "\n".join(gate_out.strip().splitlines()[-5:])
+            lines += [f"## THO canonical regression gate (rc={code_g})", "```", tail, "```"]
+            after_head, head_error = _tho_head(workspace)
+            if after_head is None or after_head != expected_head:
+                lines += ["", "THO CANONICAL ARTIFACT GUARD: canonical suite changed HEAD "
+                          f"from {expected_head} to {after_head or head_error}."]
+                ok = False
+            else:
+                clean, detail = _tho_clean_tree(workspace)
+                if not clean:
+                    lines += ["", f"THO CANONICAL ARTIFACT GUARD: canonical suite left changes: {detail}"]
+                    ok = False
+                else:
+                    ok = code_g == 0
+
+        if ok:
+            final_ok, reason = _tho_final_artifact_guard(workspace, base, tested_head or "")
+            if not final_ok:
+                lines += ["", f"THO FINAL ARTIFACT GUARD: {reason}"]
+                ok = False
+
+        if ok:
+            REPORTS.mkdir(parents=True, exist_ok=True)
+            bundle = make_bundle(workspace, name, base)
+            if not Path(bundle).is_file():
+                ok = False
+    except Exception as exc:
+        lines += ["", f"CRASH: {type(exc).__name__}: {exc}"]
+        ok = False
+    finally:
+        if workspace is not None:
+            try:
+                shutil.rmtree(workspace)
+            except Exception as cleanup_error:
+                ok = False
+                lines += ["", f"THO CLEANUP FAILED for {workspace}: "
+                          f"{type(cleanup_error).__name__}: {cleanup_error}"]
+            if workspace.exists():
+                ok = False
+                lines += ["", f"THO CLEANUP FAILED: workspace still exists: {workspace}"]
+        for key in ("task", "repo", "branch"):
+            _heartbeat_state.pop(key, None)
+    lines += ["", f"- bundle: {bundle}", f"- finished: {now()}",
+              f"- RESULT: {'PASS' if ok else 'FAIL'}",
+              "- Mac review is required; the worker never pushes, merges, deploys, or sends replies."]
+    report(name, lines)
+    return ok
+
+
 def run_task(task: dict) -> bool:
+    if is_tho_task(task):
+        return _run_tho_task(task)
     name, repo, goal, test = task["name"], task["repo"], task["goal"], task["test"]
     analysis_only = task.get("analysis_only", False)
     lines = [f"# worker task: {name}", f"- started: {now()}", f"- repo: {repo}",
