@@ -1,10 +1,57 @@
 """Unit tests for the sovereign windows worker (pure functions only)."""
 
 import sys
+import subprocess as sp
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 import worker
+
+
+def _git(repo, *args):
+    return sp.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True)
+
+
+def _make_git_repo(tmp_path):
+    repo = tmp_path / "Project-Go-Forward"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.email", "tests@example.com")
+    _git(repo, "config", "user.name", "Tests")
+    (repo / "app.py").write_text("VALUE = 1\n")
+    _git(repo, "add", "app.py")
+    _git(repo, "commit", "-m", "initial")
+    _git(repo, "remote", "add", "origin", str(repo))
+    _git(repo, "fetch", "origin", "main:refs/remotes/origin/main")
+    return repo
+
+
+def _make_tho_bundle(tmp_path, monkeypatch):
+    repo = _make_git_repo(tmp_path)
+    base = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    incoming = tmp_path / "agent-worker" / "incoming-bundles"
+    incoming.mkdir(parents=True)
+    bundle = incoming / "tho.bundle"
+    _git(repo, "bundle", "create", str(bundle), "main")
+    monkeypatch.setattr(worker, "BASE", tmp_path / "agent-worker")
+    return repo, base, bundle
+
+
+def _tho_task(bundle, base, **overrides):
+    task = {
+        "name": "mark-request",
+        "repo": Path(r"C:\Users\aribs\Code\Project-Go-Forward"),
+        "test": "python -m pytest tests/test_request.py -q",
+        "goal": "Implement the normalized request.",
+        "analysis_only": False,
+        "source": "gmail-mark-tho",
+        "message_id": "18f-mark-message",
+        "message_date": "2026-07-13",
+        "base_sha": base,
+        "base_bundle": str(bundle),
+    }
+    task.update(overrides)
+    return task
 
 
 def test_parse_task_roundtrip(tmp_path):
@@ -254,3 +301,170 @@ def test_regular_task_fails_with_zero_commits(tmp_path, monkeypatch):
     report_lines = "\n".join(reports[-1][1])
     assert "NO-OP GUARD" in report_lines
     assert "RESULT: FAIL" in report_lines
+
+
+def test_generic_tho_task_is_not_special_and_remains_rejected(tmp_path, monkeypatch):
+    repo = tmp_path / "Project-Go-Forward"
+    repo.mkdir()
+    task = {
+        "name": "generic-tho", "repo": repo, "test": "pytest -q",
+        "goal": "Change production code.", "analysis_only": False,
+        "source": "", "message_id": "", "message_date": "",
+        "base_sha": "", "base_bundle": "",
+    }
+    reports = []
+    monkeypatch.setattr(worker, "report", lambda name, lines: reports.append(lines) or tmp_path / "r.md")
+
+    assert worker.is_tho_task(task) is False
+    assert worker.run_task(task) is False
+    assert "not in ALLOWLIST" in "\n".join(reports[-1])
+
+
+def test_allowlist_remains_tho_free():
+    assert all(path.name != "Project-Go-Forward" for path in worker.ALLOWLIST)
+
+
+def test_tho_validation_requires_exact_provenance(tmp_path, monkeypatch):
+    _, base, bundle = _make_tho_bundle(tmp_path, monkeypatch)
+    valid = _tho_task(bundle, base)
+    assert worker.validate_tho_task(valid) == (True, "")
+
+    for field, bad_value in (
+        ("source", "gmail-tho"),
+        ("message_id", ""),
+        ("message_date", ""),
+        ("base_sha", base.upper()),
+        ("base_sha", base[:-1]),
+        ("test", ""),
+    ):
+        ok, reason = worker.validate_tho_task({**valid, field: bad_value})
+        assert not ok, (field, reason)
+
+
+def test_tho_validation_rejects_bundle_path_traversal(tmp_path, monkeypatch):
+    _, base, bundle = _make_tho_bundle(tmp_path, monkeypatch)
+    outside = tmp_path / "outside.bundle"
+    outside.write_bytes(bundle.read_bytes())
+
+    ok, reason = worker.validate_tho_task(_tho_task(outside, base))
+
+    assert not ok
+    assert "incoming-bundles" in reason
+
+
+def test_prepare_tho_workspace_rejects_stale_or_mismatched_sha(tmp_path, monkeypatch):
+    _, base, bundle = _make_tho_bundle(tmp_path, monkeypatch)
+    wrong = "0" * 40 if base != "0" * 40 else "1" * 40
+
+    try:
+        worker.prepare_tho_workspace(_tho_task(bundle, wrong))
+    except ValueError as exc:
+        assert "base_sha" in str(exc) or "SHA" in str(exc)
+    else:
+        raise AssertionError("mismatched SHA was accepted")
+
+
+def test_prepare_tho_workspace_clones_bundle_at_exact_sha(tmp_path, monkeypatch):
+    _, base, bundle = _make_tho_bundle(tmp_path, monkeypatch)
+    workspace = worker.prepare_tho_workspace(_tho_task(bundle, base))
+
+    assert workspace.parent == worker.BASE / "tho-workspaces"
+    assert _git(workspace, "rev-parse", "HEAD").stdout.strip() == base
+    assert (workspace / "app.py").read_text() == "VALUE = 1\n"
+
+
+def test_validate_tho_changed_paths_rejects_prohibited_files(tmp_path):
+    repo = _make_git_repo(tmp_path)
+    base = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    for path in (
+        "tho_documents/client.txt",
+        ".github/workflows/deploy.yml",
+        ".env",
+        "backend/.env",
+        "config/service-account.json",
+        "private/id_rsa",
+    ):
+        _git(repo, "reset", "--hard", base)
+        target = repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("secret\n")
+        _git(repo, "add", path)
+        _git(repo, "commit", "-m", f"touch {path}")
+        ok, rejected = worker.validate_tho_changed_paths(repo, base)
+        assert not ok, path
+        assert path in rejected
+        _git(repo, "reset", "--hard", base)
+
+
+def test_validate_tho_changed_paths_allows_safe_source_and_tests(tmp_path):
+    repo = _make_git_repo(tmp_path)
+    base = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    (repo / "app.py").write_text("VALUE = 2\n")
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_app.py").write_text("def test_app(): assert True\n")
+    _git(repo, "add", "app.py", "tests/test_app.py")
+    _git(repo, "commit", "-m", "safe change")
+
+    assert worker.validate_tho_changed_paths(repo, base) == (True, [])
+
+
+def test_validate_tho_changed_paths_includes_uncommitted_changes(tmp_path):
+    repo = _make_git_repo(tmp_path)
+    base = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    (repo / ".env").write_text("SECRET=value\n")
+
+    ok, rejected = worker.validate_tho_changed_paths(repo, base)
+
+    assert not ok
+    assert ".env" in rejected
+
+
+def test_stage_request_emits_verified_bundle_and_roundtrippable_task(tmp_path):
+    from stage_tho_request import stage_request
+
+    repo = _make_git_repo(tmp_path)
+    request = tmp_path / "normalized.txt"
+    request.write_text("Add the explicitly requested health field.\n")
+    output = tmp_path / "staged"
+
+    bundle, task_path = stage_request(
+        repo=repo,
+        request_file=request,
+        message_id="gmail-123",
+        message_date="2026-07-13",
+        test="python -m pytest tests/test_healthz.py -q",
+        output_dir=output,
+        worker_repo=r"C:\Users\aribs\Code\Project-Go-Forward",
+    )
+
+    assert bundle.suffix == ".bundle"
+    assert _git(repo, "bundle", "verify", str(bundle)).returncode == 0
+    task = worker.parse_task(task_path)
+    assert task is not None
+    assert task["source"] == "gmail-mark-tho"
+    assert task["message_id"] == "gmail-123"
+    assert task["message_date"] == "2026-07-13"
+    assert task["base_sha"] == _git(repo, "rev-parse", "origin/main").stdout.strip()
+    assert Path(task["base_bundle"]).name == bundle.name
+    assert task["goal"] == request.read_text().strip()
+
+
+def test_tho_task_fails_when_result_bundle_cannot_be_created(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    task = _tho_task(tmp_path / "ignored.bundle", "a" * 40)
+    reports = []
+    monkeypatch.setattr(worker, "REPORTS", tmp_path / "reports")
+    monkeypatch.setattr(worker, "validate_tho_task", lambda task: (True, ""))
+    monkeypatch.setattr(worker, "prepare_tho_workspace", lambda task: workspace)
+    monkeypatch.setattr(worker, "heartbeat", lambda *args: None)
+    monkeypatch.setattr(worker, "_tho_diff_lines", lambda repo, base: 1)
+    monkeypatch.setattr(worker, "validate_tho_changed_paths", lambda repo, base: (True, []))
+    monkeypatch.setattr(worker, "commits_made", lambda repo, base: 1)
+    monkeypatch.setattr(worker, "changed_source_files", lambda repo, base: [])
+    monkeypatch.setattr(worker, "make_bundle", lambda repo, name, base: "bundle failed: disk full")
+    monkeypatch.setattr(worker, "report", lambda name, lines: reports.append(lines) or tmp_path / "r.md")
+    monkeypatch.setattr(worker, "sh", lambda *args, **kwargs: (0, ""))
+
+    assert worker.run_task(task) is False
+    assert "bundle failed: disk full" in "\n".join(reports[-1])
