@@ -79,9 +79,10 @@ MAX_AUTO_PER_DAY = 4
 MAX_PROPOSED = 12
 THO_SOURCE = "gmail-mark-tho"
 THO_MAX_DIFF_LINES = 500
-THO_CANONICAL_SUITE = (
-    "python -m pytest tests/test_healthz.py tests/test_api_v1.py "
-    "tests/test_document_engine.py -q"
+THO_CANONICAL_TESTS = (
+    "tests/test_healthz.py",
+    "tests/test_api_v1.py",
+    "tests/test_document_engine.py",
 )
 
 
@@ -287,8 +288,18 @@ def prepare_tho_workspace(task: dict) -> Path:
         if code != 0 or head.strip() != sha:
             raise ValueError("workspace HEAD does not equal the supplied base_sha")
         return workspace
-    except Exception:
-        shutil.rmtree(workspace, ignore_errors=True)
+    except Exception as original:
+        try:
+            shutil.rmtree(workspace)
+        except Exception as cleanup_error:
+            raise RuntimeError(
+                f"workspace preparation failed ({original}); cleanup failed for "
+                f"{workspace}: {cleanup_error}"
+            ) from cleanup_error
+        if workspace.exists():
+            raise RuntimeError(
+                f"workspace preparation failed ({original}); cleanup left {workspace} present"
+            ) from original
         raise
 
 
@@ -532,6 +543,38 @@ def _cleanup_repo(repo: Path, base: str | None, branch: str, stash_ref: str | No
             pass
 
 
+def _tho_head(repo: Path) -> tuple[str | None, str]:
+    code, out = sh(["git", "-C", str(repo), "rev-parse", "HEAD"], timeout=60)
+    return (out.strip(), "") if code == 0 else (None, out[-300:])
+
+
+def _tho_clean_tree(repo: Path) -> tuple[bool, str]:
+    code, out = sh(["git", "-C", str(repo), "status", "--porcelain"], timeout=60)
+    if code != 0:
+        return False, f"git status failed: {out[-300:]}"
+    if out.strip():
+        return False, out.strip()[:500]
+    return True, ""
+
+
+def _tho_final_artifact_guard(repo: Path, base: str, expected_head: str) -> tuple[bool, str]:
+    head, error = _tho_head(repo)
+    if head is None:
+        return False, f"could not read final HEAD: {error}"
+    if head != expected_head:
+        return False, f"final HEAD changed from tested {expected_head} to {head}"
+    clean, detail = _tho_clean_tree(repo)
+    if not clean:
+        return False, f"final working tree is not clean: {detail}"
+    n_diff = _tho_diff_lines(repo, base)
+    if n_diff > THO_MAX_DIFF_LINES:
+        return False, f"final diff is {n_diff} lines (> {THO_MAX_DIFF_LINES})"
+    paths_ok, rejected = validate_tho_changed_paths(repo, base)
+    if not paths_ok:
+        return False, "final prohibited paths: " + ", ".join(rejected)
+    return True, ""
+
+
 def _run_tho_task(task: dict) -> bool:
     """Execute an explicit THO request only inside its disposable bundle clone."""
     name, goal, test = task["name"], task["goal"], task["test"]
@@ -550,6 +593,8 @@ def _run_tho_task(task: dict) -> bool:
     base = task["base_sha"]
     ok = False
     test_out = ""
+    tested_head: str | None = None
+    bundle = "not created: task failed safety gates"
     try:
         workspace = prepare_tho_workspace(task)
         _heartbeat_state.update(task=name, repo=str(workspace), branch=branch)
@@ -582,46 +627,84 @@ def _run_tho_task(task: dict) -> bool:
             if not paths_ok:
                 lines += ["", "THO PATH GUARD rejected: " + ", ".join(rejected)]
                 break
+            clean, detail = _tho_clean_tree(workspace)
+            if not clean:
+                lines += ["", f"THO CLEAN-TREE GUARD before task tests: {detail}"]
+                break
+            expected_head, head_error = _tho_head(workspace)
+            if expected_head is None:
+                lines += ["", f"THO HEAD GUARD before task tests: {head_error}"]
+                break
             code_t, test_out = sh(test_argv, cwd=workspace, timeout=TEST_TIMEOUT_S)
             lines += [f"## tests attempt {attempt} (rc={code_t})", "```", test_out[-2000:], "```"]
+            after_head, head_error = _tho_head(workspace)
+            if after_head is None or after_head != expected_head:
+                lines += ["", "THO TEST ARTIFACT GUARD: task tests changed HEAD "
+                          f"from {expected_head} to {after_head or head_error}."]
+                break
+            clean, detail = _tho_clean_tree(workspace)
+            if not clean:
+                lines += ["", f"THO TEST ARTIFACT GUARD: task tests left changes: {detail}"]
+                break
             if code_t == 0:
                 ok = True
+                tested_head = expected_head
                 break
 
         if ok and commits_made(workspace, base) == 0:
             lines += ["", "NO-OP GUARD: task tests pass but the agent produced no commits — marking FAIL."]
             ok = False
 
-        if ok:
-            code_dirty, dirty = sh(
-                ["git", "-C", str(workspace), "status", "--porcelain"], timeout=60,
-            )
-            if code_dirty != 0 or dirty.strip():
-                lines += ["", "THO CLEAN-TREE GUARD: uncommitted changes cannot be included in the result bundle."]
-                ok = False
-
         if ok and changed_source_files(workspace, base):
             heartbeat("task", f"{name} THO canonical regression gate")
-            code_g, gate_out = sh(THO_CANONICAL_SUITE, cwd=workspace, timeout=TEST_TIMEOUT_S)
+            canonical_argv = [str(PYTHON), "-m", "pytest", *THO_CANONICAL_TESTS, "-q"]
+            expected_head = tested_head
+            code_g, gate_out = sh(canonical_argv, cwd=workspace, timeout=TEST_TIMEOUT_S)
             tail = "\n".join(gate_out.strip().splitlines()[-5:])
             lines += [f"## THO canonical regression gate (rc={code_g})", "```", tail, "```"]
-            ok = code_g == 0
+            after_head, head_error = _tho_head(workspace)
+            if after_head is None or after_head != expected_head:
+                lines += ["", "THO CANONICAL ARTIFACT GUARD: canonical suite changed HEAD "
+                          f"from {expected_head} to {after_head or head_error}."]
+                ok = False
+            else:
+                clean, detail = _tho_clean_tree(workspace)
+                if not clean:
+                    lines += ["", f"THO CANONICAL ARTIFACT GUARD: canonical suite left changes: {detail}"]
+                    ok = False
+                else:
+                    ok = code_g == 0
 
-        REPORTS.mkdir(parents=True, exist_ok=True)
-        bundle = make_bundle(workspace, name, base)
-        if not Path(bundle).is_file():
-            ok = False
-        lines += ["", f"- bundle: {bundle}", f"- finished: {now()}",
-                  f"- RESULT: {'PASS' if ok else 'FAIL'}",
-                  "- Mac review is required; the worker never pushes, merges, deploys, or sends replies."]
+        if ok:
+            final_ok, reason = _tho_final_artifact_guard(workspace, base, tested_head or "")
+            if not final_ok:
+                lines += ["", f"THO FINAL ARTIFACT GUARD: {reason}"]
+                ok = False
+
+        if ok:
+            REPORTS.mkdir(parents=True, exist_ok=True)
+            bundle = make_bundle(workspace, name, base)
+            if not Path(bundle).is_file():
+                ok = False
     except Exception as exc:
         lines += ["", f"CRASH: {type(exc).__name__}: {exc}"]
         ok = False
     finally:
         if workspace is not None:
-            shutil.rmtree(workspace, ignore_errors=True)
+            try:
+                shutil.rmtree(workspace)
+            except Exception as cleanup_error:
+                ok = False
+                lines += ["", f"THO CLEANUP FAILED for {workspace}: "
+                          f"{type(cleanup_error).__name__}: {cleanup_error}"]
+            if workspace.exists():
+                ok = False
+                lines += ["", f"THO CLEANUP FAILED: workspace still exists: {workspace}"]
         for key in ("task", "repo", "branch"):
             _heartbeat_state.pop(key, None)
+    lines += ["", f"- bundle: {bundle}", f"- finished: {now()}",
+              f"- RESULT: {'PASS' if ok else 'FAIL'}",
+              "- Mac review is required; the worker never pushes, merges, deploys, or sends replies."]
     report(name, lines)
     return ok
 

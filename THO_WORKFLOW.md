@@ -28,6 +28,9 @@ fetch Gmail, use the network, modify the source clone, or send a reply.
 The test command must be a shell-free, repo-local Python pytest or npm test invocation.
 Shell chaining, redirection, substitution, external executables, absolute paths, and
 parent-directory traversal are rejected during staging and again on the worker.
+Every staging header is single-line, the message date is a real calendar date in exact
+`YYYY-MM-DD` form, and the worker repository header is fixed to
+`C:\Users\aribs\Code\Project-Go-Forward`.
 
 ## 2. Transfer the two artifacts
 
@@ -45,6 +48,14 @@ a `worker/*` branch. It rejects missing or mismatched provenance, traversal, sta
 ancestor SHAs, prohibited paths (including both sides of renames), diffs over 500 lines,
 missing tests, failing task tests, and failing canonical regressions for source changes.
 It creates and verifies the result bundle before deleting only that generated workspace.
+
+Task tests and the canonical suite are read-only verification steps: the worker records
+the post-aider commit and rejects any test process that changes HEAD or leaves working-tree
+changes. Immediately before bundle creation it repeats the clean-tree, 500-line, protected-
+path, and tested-HEAD checks. The canonical suite runs as fixed argv through the configured
+worker Python executable, never through a shell. Workspace deletion is verified; a Windows
+file-lock or any other cleanup failure is reported with its exact path/error and forces the
+final result to FAIL.
 
 The worker never stashes, switches, cleans, or edits the existing Windows
 `Project-Go-Forward` clone. It never pushes, merges, deploys, changes DNS, reads Gmail,

@@ -7,11 +7,14 @@ and a clone whose origin/main reference has already been refreshed by the operat
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import re
 import subprocess
 from pathlib import Path
 
 from worker import parse_tho_test_command
+
+THO_WORKER_REPO = r"C:\Users\aribs\Code\Project-Go-Forward"
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -33,15 +36,29 @@ def stage_request(
     message_date: str,
     test: str,
     output_dir: Path,
-    worker_repo: str = r"C:\Users\aribs\Code\Project-Go-Forward",
+    worker_repo: str = THO_WORKER_REPO,
 ) -> tuple[Path, Path]:
     """Create a verified full bundle and its round-trippable worker task file."""
     repo = repo.resolve()
     request_file = request_file.resolve()
     if not repo.is_dir() or not request_file.is_file():
         raise ValueError("repo and normalized request file must exist")
+    for field, value in (
+        ("message_id", message_id), ("message_date", message_date),
+        ("test", test), ("worker_repo", worker_repo),
+    ):
+        if "\r" in value or "\n" in value:
+            raise ValueError(f"{field} must be a single-line header value")
     if not message_id.strip() or not message_date.strip() or not test.strip():
         raise ValueError("message_id, message_date, and test are required")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", message_date):
+        raise ValueError("message_date must be exactly YYYY-MM-DD")
+    try:
+        dt.date.fromisoformat(message_date)
+    except ValueError as exc:
+        raise ValueError("message_date must be a valid calendar date") from exc
+    if worker_repo != THO_WORKER_REPO:
+        raise ValueError(f"worker_repo must be exactly {THO_WORKER_REPO}")
     parse_tho_test_command(test)
     goal = request_file.read_text(encoding="utf-8").strip()
     if not goal:
@@ -87,7 +104,7 @@ def main() -> None:
     parser.add_argument("--test", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
-        "--worker-repo", default=r"C:\Users\aribs\Code\Project-Go-Forward",
+        "--worker-repo", default=THO_WORKER_REPO,
     )
     args = parser.parse_args()
     bundle, task = stage_request(
