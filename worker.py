@@ -576,11 +576,16 @@ def commits_made(repo: Path, base: str | None = None) -> int:
 
 def has_worktree_changes(repo: Path) -> bool:
     """Return True for tracked or untracked task changes left outside commits."""
-    code, out = sh(
+    code, out = worktree_status(repo)
+    return code != 0 or bool(out.strip())
+
+
+def worktree_status(repo: Path) -> tuple[int, str]:
+    """Return a stable, fully expanded worktree snapshot for delta checks."""
+    return sh(
         ["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=all"],
         timeout=120,
     )
-    return code != 0 or bool(out.strip())
 
 
 def acquire_instance_lock(path: Path = INSTANCE_LOCK):
@@ -916,6 +921,7 @@ def run_task(task: dict) -> bool:
     test_out = ""
     gate = QUICK_SUITE.get(repo.name)
     baseline: tuple[int, str] | None = None
+    analysis_status_before: tuple[int, str] | None = None
 
     _heartbeat_state["task"] = name
     _heartbeat_state["repo"] = str(repo)
@@ -941,6 +947,8 @@ def run_task(task: dict) -> bool:
 
         code, _ = sh(["git", "-C", str(repo), "switch", "-C", branch, base], timeout=120)
         lines.append(f"- branch: {branch} from {base} (rc={code})")
+        if analysis_only:
+            analysis_status_before = worktree_status(repo)
 
         for attempt in (1, 2):
             heartbeat("task", f"{name} attempt {attempt}")
@@ -968,7 +976,15 @@ def run_task(task: dict) -> bool:
         task_commits = commits_made(repo, base)
         # Analysis means read-only: fail closed if the model changed or committed
         # anything. Regular build tasks must have at least one commit.
-        if ok and analysis_only and (task_commits > 0 or has_worktree_changes(repo)):
+        analysis_status_after = worktree_status(repo) if analysis_only else None
+        analysis_changed = (
+            analysis_status_before is None
+            or analysis_status_after is None
+            or analysis_status_before[0] != 0
+            or analysis_status_after[0] != 0
+            or analysis_status_before[1] != analysis_status_after[1]
+        )
+        if ok and analysis_only and (task_commits > 0 or analysis_changed):
             lines += ["", "ANALYSIS-ONLY GUARD: the agent changed files — marking FAIL."]
             ok = False
         elif ok and not analysis_only and task_commits == 0:
