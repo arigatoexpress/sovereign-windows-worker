@@ -68,7 +68,10 @@ ALLOWLIST = [
 # NEVER add Project-Go-Forward (THO client prod fence) or any repo with push creds.
 
 QUICK_SUITE = {
-    "Sapphire": "python -m pytest tests/unit -q -x --timeout=300",
+    # Collect the complete failure set. With -x, fixing the first baseline
+    # failure exposes the next pre-existing failure and falsely looks like a
+    # regression.
+    "Sapphire": "python -m pytest tests/unit -q --timeout=300",
 }
 
 TASK_TIMEOUT_S = 45 * 60
