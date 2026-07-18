@@ -21,6 +21,20 @@ def test_aider_command_is_bounded_and_noninteractive():
     assert cmd[-2:] == ["--message", "fix the test"]
 
 
+def test_goal_files_adds_existing_explicit_paths(tmp_path):
+    test_file = tmp_path / "tests" / "unit" / "test_demo.py"
+    test_file.parent.mkdir(parents=True)
+    test_file.write_text("def test_demo(): pass\n")
+
+    files = worker.goal_files(
+        "Fix tests/unit/test_demo.py::test_demo; ignore missing/file.py.", tmp_path,
+    )
+
+    assert files == ["tests/unit/test_demo.py"]
+    cmd = worker.aider_command("fix it", files)
+    assert cmd[-3:] == ["tests/unit/test_demo.py", "--message", "fix it"]
+
+
 def test_sapphire_regression_gate_collects_all_failures():
     command = worker.QUICK_SUITE["Sapphire"]
     assert "tests/unit" in command
