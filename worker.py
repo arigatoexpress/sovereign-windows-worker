@@ -32,6 +32,7 @@ Task file format (queue\\<name>.md):
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -51,6 +52,7 @@ FAILED = BASE / "failed"
 REPORTS = BASE / "reports"
 HEARTBEAT = BASE / "heartbeat.json"
 METRICS = BASE / "metrics.json"
+BASELINE_CACHE = BASE / "baseline-cache"
 START_TIME = time.time()
 
 AIDER = Path(os.environ.get("SOV_WORKER_AIDER", HOME / ".aider-venv" / "Scripts" / "aider.exe"))
@@ -60,6 +62,8 @@ WEAK_MODEL = os.environ.get("SOV_WORKER_WEAK_MODEL", "ollama/gemma3:4b")
 MAP_TOKENS = os.environ.get("SOV_WORKER_MAP_TOKENS", "512")
 MAX_CHAT_HISTORY_TOKENS = os.environ.get("SOV_WORKER_MAX_CHAT_TOKENS", "8192")
 EDIT_FORMAT = os.environ.get("SOV_WORKER_EDIT_FORMAT", "diff")
+RELEASE = os.environ.get("SOV_WORKER_RELEASE", "source")
+BASELINE_CACHE_TTL_S = int(os.environ.get("SOV_WORKER_BASELINE_CACHE_TTL_S", "21600"))
 
 ALLOWLIST = [
     HOME / "Code" / "Sapphire",
@@ -84,6 +88,7 @@ MAX_AUTO_QUEUED = 2
 MAX_AUTO_PER_DAY = 4
 MAX_PROPOSED = 12
 THO_SOURCE = "gmail-mark-tho"
+THO_ENABLED = os.environ.get("SOV_WORKER_THO_ENABLED", "0") == "1"
 THO_MAX_DIFF_LINES = 500
 THO_CANONICAL_TESTS = (
     "tests/test_healthz.py",
@@ -462,6 +467,9 @@ def heartbeat(state: str, detail: str = "") -> None:
     payload = {
         "ts": now(),
         "state": state,
+        "release": RELEASE,
+        "model": MODEL,
+        "edit_format": EDIT_FORMAT,
         "detail": detail[:200],
         "uptime_s": int(time.time() - START_TIME),
     }
@@ -551,6 +559,72 @@ def commits_made(repo: Path, base: str | None = None) -> int:
         return int(out.strip()) if code == 0 else 0
     except ValueError:
         return 0
+
+
+_PYTEST_FAILURE_RE = re.compile(r"^(?:FAILED|ERROR)\s+([^\s]+)", re.MULTILINE)
+
+
+def pytest_failure_ids(output: str) -> set[str]:
+    """Extract stable pytest node IDs from the short test summary."""
+    return {match.group(1) for match in _PYTEST_FAILURE_RE.finditer(output)}
+
+
+def regression_verdict(
+    baseline_code: int,
+    baseline_output: str,
+    candidate_code: int,
+    candidate_output: str,
+) -> tuple[bool, str, set[str]]:
+    """Accept a red candidate only when all failures already exist on the base."""
+    if candidate_code == 0:
+        return True, "candidate quick suite is green", set()
+    if candidate_code in (124, 125):
+        label = "timed out" if candidate_code == 124 else "could not execute"
+        return False, f"candidate quick suite {label}", set()
+
+    candidate_failures = pytest_failure_ids(candidate_output)
+    baseline_failures = pytest_failure_ids(baseline_output)
+    if baseline_code == 0:
+        return False, "candidate introduced failures against a green baseline", candidate_failures
+    if baseline_code in (124, 125):
+        return False, "baseline quick suite was inconclusive; failing closed", candidate_failures
+    if not baseline_failures or not candidate_failures:
+        return False, "quick-suite failure could not be compared safely", candidate_failures
+
+    new_failures = candidate_failures - baseline_failures
+    if new_failures:
+        return False, f"candidate introduced {len(new_failures)} new failure(s)", new_failures
+    return True, "candidate failures are baseline-equivalent", set()
+
+
+def _baseline_cache_path(repo: Path, base_sha: str, command: str) -> Path:
+    material = f"{repo.resolve()}\0{base_sha}\0{command}".encode()
+    return BASELINE_CACHE / f"{hashlib.sha256(material).hexdigest()}.json"
+
+
+def baseline_gate(repo: Path, base: str, command: str) -> tuple[int, str, str]:
+    """Return a complete baseline result, cached by exact HEAD and command."""
+    code_sha, base_sha = sh(["git", "-C", str(repo), "rev-parse", base], timeout=60)
+    if code_sha != 0 or not base_sha.strip():
+        return 125, f"could not resolve baseline {base}: {base_sha}", "error"
+    cache_path = _baseline_cache_path(repo, base_sha.strip(), command)
+    try:
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+        if time.time() - float(cached["created_at"]) <= BASELINE_CACHE_TTL_S:
+            return int(cached["code"]), str(cached["output"]), "hit"
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        pass
+
+    code, output = sh(command, cwd=repo, timeout=TEST_TIMEOUT_S)
+    if code not in (124, 125):
+        BASELINE_CACHE.mkdir(parents=True, exist_ok=True)
+        tmp = cache_path.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps({"created_at": time.time(), "code": code, "output": output}),
+            encoding="utf-8",
+        )
+        tmp.replace(cache_path)
+    return code, output, "miss"
 
 
 def make_bundle(repo: Path, name: str, base: str | None = None) -> str:
@@ -776,6 +850,8 @@ def run_task(task: dict) -> bool:
     stash_ref: str | None = None
     ok = False
     test_out = ""
+    gate = QUICK_SUITE.get(repo.name)
+    baseline: tuple[int, str] | None = None
 
     _heartbeat_state["task"] = name
     _heartbeat_state["repo"] = str(repo)
@@ -788,6 +864,16 @@ def run_task(task: dict) -> bool:
         if code == 0 and "Saved working directory" in stash_out:
             # Most recent stash is at index 0.
             stash_ref = "0"
+
+        if gate and not analysis_only:
+            heartbeat("task", f"{name} baseline regression gate")
+            code_b, out_b, cache_status = baseline_gate(repo, base, gate)
+            baseline = (code_b, out_b)
+            tail = "\n".join(out_b.strip().splitlines()[-5:])
+            lines += [
+                f"## baseline regression gate (rc={code_b}, cache={cache_status})",
+                "```", tail, "```",
+            ]
 
         code, _ = sh(["git", "-C", str(repo), "switch", "-C", branch, base], timeout=120)
         lines.append(f"- branch: {branch} from {base} (rc={code})")
@@ -826,14 +912,23 @@ def run_task(task: dict) -> bool:
         # Regression gate: source-touching diffs must also pass the repo quick suite.
         if ok:
             touched = changed_source_files(repo, base)
-            gate = QUICK_SUITE.get(repo.name)
             if touched and gate:
                 heartbeat("task", f"{name} regression gate")
                 code_g, gate_out = sh(gate, cwd=repo, timeout=TEST_TIMEOUT_S)
                 tail = "\n".join(gate_out.strip().splitlines()[-5:])
                 lines += [f"## regression gate (source files touched: {len(touched)}) rc={code_g}",
                           "```", tail, "```"]
-                ok = code_g == 0
+                if baseline is None:
+                    ok = code_g == 0
+                    reason = "candidate quick suite is green" if ok else "baseline unavailable; failing closed"
+                    new_failures: set[str] = set()
+                else:
+                    ok, reason, new_failures = regression_verdict(
+                        baseline[0], baseline[1], code_g, gate_out,
+                    )
+                lines.append(f"- regression verdict: {reason}")
+                if new_failures:
+                    lines.append("- new failures: " + ", ".join(sorted(new_failures)))
 
         bundle = make_bundle(repo, name, base)
         lines += ["", f"- bundle: {bundle}", f"- finished: {now()}",
@@ -950,6 +1045,18 @@ def sweep() -> None:
     mine_backlog()
 
 
+def execute_task(task: dict) -> bool:
+    """Apply deployment feature gates before entering a task lane."""
+    if is_tho_task(task) and not THO_ENABLED:
+        report(task["name"], [
+            f"# worker task: {task['name']}",
+            "REJECTED: guarded THO lane is disabled on this worker.",
+            "- RESULT: FAIL",
+        ])
+        return False
+    return run_task(task)
+
+
 def main() -> None:
     for d in (QUEUE, PROPOSED, DONE, FAILED, REPORTS):
         d.mkdir(parents=True, exist_ok=True)
@@ -965,7 +1072,7 @@ def main() -> None:
                                        "missing 'repo:' header or '---' separator"])
                     archive_task(path, FAILED)
                     continue
-                ok = run_task(task)
+                ok = execute_task(task)
                 update_metrics(increment=("tasks", "pass" if ok else "fail"))
                 archive_task(path, DONE if ok else FAILED)
                 heartbeat("idle", f"finished {path.stem}: {'PASS' if ok else 'FAIL'}")

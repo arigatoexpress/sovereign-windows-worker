@@ -42,6 +42,60 @@ def test_sapphire_regression_gate_collects_all_failures():
     assert "-x" not in command.split()
 
 
+def test_regression_verdict_allows_only_baseline_failures():
+    baseline = "FAILED tests/unit/test_a.py::test_a - old\nFAILED tests/unit/test_b.py::test_b - old"
+    candidate = "FAILED tests/unit/test_b.py::test_b - old"
+    assert worker.regression_verdict(1, baseline, 1, candidate) == (
+        True, "candidate failures are baseline-equivalent", set(),
+    )
+    ok, reason, new = worker.regression_verdict(
+        1, baseline, 1, candidate + "\nFAILED tests/unit/test_c.py::test_c - new",
+    )
+    assert not ok and "introduced 1" in reason
+    assert new == {"tests/unit/test_c.py::test_c"}
+
+
+def test_baseline_gate_caches_by_head_and_command(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.email", "tests@example.com")
+    _git(repo, "config", "user.name", "Tests")
+    (repo / "file.py").write_text("VALUE = 1\n")
+    _git(repo, "add", "file.py")
+    _git(repo, "commit", "-m", "initial")
+    monkeypatch.setattr(worker, "BASELINE_CACHE", tmp_path / "cache")
+    calls = []
+    real_sh = worker.sh
+
+    def fake_sh(cmd, cwd=None, timeout=600):
+        if isinstance(cmd, str):
+            calls.append(cmd)
+            return 1, "FAILED tests/unit/test_a.py::test_a - old"
+        return real_sh(cmd, cwd=cwd, timeout=timeout)
+
+    monkeypatch.setattr(worker, "sh", fake_sh)
+    first = worker.baseline_gate(repo, "main", "pytest tests/unit -q")
+    second = worker.baseline_gate(repo, "main", "pytest tests/unit -q")
+    assert first[2] == "miss" and second[2] == "hit"
+    assert calls == ["pytest tests/unit -q"]
+
+
+def test_tho_lane_defaults_disabled():
+    assert worker.THO_ENABLED is False
+
+
+def test_execute_task_rejects_tho_when_disabled(tmp_path, monkeypatch):
+    task = {"name": "tho-disabled"}
+    monkeypatch.setattr(worker, "is_tho_task", lambda candidate: True)
+    reports = []
+    monkeypatch.setattr(
+        worker, "report", lambda name, lines: reports.append(lines) or tmp_path / "report.md",
+    )
+    assert worker.execute_task(task) is False
+    assert "THO lane is disabled" in "\n".join(reports[-1])
+
+
 def _git(repo, *args):
     return sp.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True)
 
