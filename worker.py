@@ -101,6 +101,12 @@ TASK_CHARTER = """Work from the exact failing contract and make the smallest roo
 Preserve production behavior and structured-data formats. Do not merely add diagnostics,
 weaken assertions, or redesign unrelated code. The worker will run tests after your edit."""
 
+ANALYSIS_CHARTER = """Read-only evidence review. Ground every claim in the provided files and
+cite file:line. Separate observed behavior from inference. Do not call a missing test a
+vulnerability or invent implementation behavior; state what cannot be determined when the
+implementation is absent. Return the single highest-impact risk and one exact validation step.
+Do not edit, create, delete, or commit any file."""
+
 
 def now() -> str:
     return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -464,7 +470,12 @@ def aider_command(message: str, files: list[str] | None = None) -> list[str]:
 
 
 def task_message(goal: str, failure_output: str = "") -> str:
-    message = f"{TASK_CHARTER}\n\nTask:\n{goal}"
+    analysis_only = (
+        goal.upper().startswith("ANALYSIS ONLY")
+        or "do not modify any files" in goal.lower()
+    )
+    charter = ANALYSIS_CHARTER if analysis_only else TASK_CHARTER
+    message = f"{charter}\n\nTask:\n{goal}"
     if failure_output:
         message += "\n\nThe previous attempt failed these tests; fix the exact failures:\n"
         message += failure_output[-3000:]
