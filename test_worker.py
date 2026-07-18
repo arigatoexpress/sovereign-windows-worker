@@ -44,6 +44,17 @@ def test_task_message_enforces_root_cause_charter_and_bounded_failure_tail():
     assert message.endswith("x" * 3000)
 
 
+def test_analysis_task_message_requires_grounded_read_only_evidence():
+    message = worker.task_message(
+        "ANALYSIS ONLY: inspect tests/test_demo.py; do not modify any files",
+    )
+    assert "Read-only evidence review" in message
+    assert "cite file:line" in message
+    assert "Do not call a missing test" in message
+    assert "vulnerability" in message
+    assert "Do not edit, create, delete, or commit" in message
+
+
 def test_sapphire_regression_gate_collects_all_failures():
     command = worker.QUICK_SUITE["Sapphire"]
     assert "tests/unit" in command
