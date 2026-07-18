@@ -22,6 +22,17 @@ def test_aider_command_is_bounded_and_noninteractive():
     assert cmd[-2:] == ["--message", "fix the test"]
 
 
+def test_analysis_aider_command_is_ask_mode_and_dry_run():
+    cmd = worker.aider_command(
+        "ANALYSIS ONLY: inspect it", ["src/demo.py"], analysis_only=True,
+    )
+    assert cmd[cmd.index("--chat-mode") + 1] == "ask"
+    assert "--dry-run" in cmd
+    assert "--no-auto-commits" in cmd
+    assert "--auto-commits" not in cmd
+    assert "src/demo.py" in cmd
+
+
 def test_goal_files_adds_existing_explicit_paths(tmp_path):
     test_file = tmp_path / "tests" / "unit" / "test_demo.py"
     test_file.parent.mkdir(parents=True)

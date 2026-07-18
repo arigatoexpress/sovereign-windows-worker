@@ -443,7 +443,12 @@ def goal_files(goal: str, repo: Path) -> list[str]:
     return files
 
 
-def aider_command(message: str, files: list[str] | None = None) -> list[str]:
+def aider_command(
+    message: str,
+    files: list[str] | None = None,
+    *,
+    analysis_only: bool = False,
+) -> list[str]:
     """Build the deterministic, non-interactive local Aider invocation."""
     command = [
         str(AIDER),
@@ -462,8 +467,10 @@ def aider_command(message: str, files: list[str] | None = None) -> list[str]:
         "--map-multiplier-no-files", "1",
         "--map-refresh", "manual",
         "--max-chat-history-tokens", MAX_CHAT_HISTORY_TOKENS,
-        "--auto-commits",
+        "--no-auto-commits" if analysis_only else "--auto-commits",
     ]
+    if analysis_only:
+        command.extend(["--chat-mode", "ask", "--dry-run"])
     command.extend(files or [])
     command.extend(["--message", message])
     return command
@@ -965,7 +972,11 @@ def run_task(task: dict) -> bool:
             heartbeat("task", f"{name} attempt {attempt}")
             msg = task_message(goal, test_out if attempt == 2 else "")
             code, out = sh(
-                aider_command(msg, goal_files(goal, repo)),
+                aider_command(
+                    msg,
+                    goal_files(goal, repo),
+                    analysis_only=analysis_only,
+                ),
                 cwd=repo, timeout=TASK_TIMEOUT_S,
             )
             lines += ["", f"## aider attempt {attempt} (rc={code})", "```", out[-2500:], "```"]
