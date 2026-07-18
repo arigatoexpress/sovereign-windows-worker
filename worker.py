@@ -573,6 +573,15 @@ def commits_made(repo: Path, base: str | None = None) -> int:
         return 0
 
 
+def has_worktree_changes(repo: Path) -> bool:
+    """Return True for tracked or untracked task changes left outside commits."""
+    code, out = sh(
+        ["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=all"],
+        timeout=120,
+    )
+    return code != 0 or bool(out.strip())
+
+
 _PYTEST_FAILURE_RE = re.compile(r"^(?:FAILED|ERROR)\s+([^\s]+)", re.MULTILINE)
 
 
@@ -913,9 +922,13 @@ def run_task(task: dict) -> bool:
                 ok = True
                 break
 
-        # No-op guard: a "PASS" with zero commits means the agent changed nothing.
-        # Analysis-only tasks are explicitly allowed (and expected) to produce no commits.
-        if ok and not analysis_only and commits_made(repo, base) == 0:
+        task_commits = commits_made(repo, base)
+        # Analysis means read-only: fail closed if the model changed or committed
+        # anything. Regular build tasks must have at least one commit.
+        if ok and analysis_only and (task_commits > 0 or has_worktree_changes(repo)):
+            lines += ["", "ANALYSIS-ONLY GUARD: the agent changed files — marking FAIL."]
+            ok = False
+        elif ok and not analysis_only and task_commits == 0:
             lines += ["", "NO-OP GUARD: task tests pass but the agent produced no commits — marking FAIL."]
             ok = False
 

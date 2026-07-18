@@ -383,6 +383,24 @@ def test_analysis_only_task_passes_with_zero_commits(tmp_path, monkeypatch):
     assert "RESULT: PASS" in report_lines
 
 
+def test_analysis_only_task_fails_if_agent_commits(tmp_path, monkeypatch):
+    repo = _make_run_task_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr(worker, "commits_made", lambda p, base=None: 1)
+    task_file = tmp_path / "analysis-mutated.md"
+    task_file.write_text(f"repo: {repo}\ntest: \n---\nANALYSIS ONLY: review code.\n")
+    task = worker.parse_task(task_file)
+    reports = []
+    monkeypatch.setattr(
+        worker, "report",
+        lambda name, lines: reports.append((name, lines)) or tmp_path / "report.md",
+    )
+
+    assert worker.run_task(task) is False
+    report_lines = "\n".join(reports[-1][1])
+    assert "ANALYSIS-ONLY GUARD" in report_lines
+    assert "RESULT: FAIL" in report_lines
+
+
 def test_regular_task_fails_with_zero_commits(tmp_path, monkeypatch):
     repo = _make_run_task_mocks(monkeypatch, tmp_path)
     task_file = tmp_path / "regular.md"
