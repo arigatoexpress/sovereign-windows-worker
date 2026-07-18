@@ -21,6 +21,12 @@ def test_aider_command_is_bounded_and_noninteractive():
     assert cmd[-2:] == ["--message", "fix the test"]
 
 
+def test_sapphire_regression_gate_collects_all_failures():
+    command = worker.QUICK_SUITE["Sapphire"]
+    assert "tests/unit" in command
+    assert "-x" not in command.split()
+
+
 def _git(repo, *args):
     return sp.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True)
 
