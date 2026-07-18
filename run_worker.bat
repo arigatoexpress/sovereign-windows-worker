@@ -1,8 +1,10 @@
 @echo off
 rem sovereign windows worker — restart-forever wrapper with log rotation.
 cd /d C:\Users\aribs\agent-worker
-set SOV_WORKER_MODEL=ollama/devstral:24b
+set SOV_WORKER_MODEL=ollama/qwen3-coder:30b
 set SOV_WORKER_WEAK_MODEL=ollama/gemma3:4b
+set SOV_WORKER_RELEASE=worker-main-c2a17b0-plus
+set SOV_WORKER_THO_ENABLED=0
 
 rem Rotate worker.log if it exceeds ~100 MB.
 for %%F in (worker.log) do (

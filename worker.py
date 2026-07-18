@@ -57,7 +57,7 @@ START_TIME = time.time()
 
 AIDER = Path(os.environ.get("SOV_WORKER_AIDER", HOME / ".aider-venv" / "Scripts" / "aider.exe"))
 PYTHON = Path(os.environ.get("SOV_WORKER_PYTHON", HOME / "AppData" / "Local" / "Programs" / "Python" / "Python313" / "python.exe"))
-MODEL = os.environ.get("SOV_WORKER_MODEL", "ollama/devstral:24b")
+MODEL = os.environ.get("SOV_WORKER_MODEL", "ollama/qwen3-coder:30b")
 WEAK_MODEL = os.environ.get("SOV_WORKER_WEAK_MODEL", "ollama/gemma3:4b")
 MAP_TOKENS = os.environ.get("SOV_WORKER_MAP_TOKENS", "512")
 MAX_CHAT_HISTORY_TOKENS = os.environ.get("SOV_WORKER_MAX_CHAT_TOKENS", "8192")
@@ -95,6 +95,10 @@ THO_CANONICAL_TESTS = (
     "tests/test_api_v1.py",
     "tests/test_document_engine.py",
 )
+
+TASK_CHARTER = """Work from the exact failing contract and make the smallest root-cause change.
+Preserve production behavior and structured-data formats. Do not merely add diagnostics,
+weaken assertions, or redesign unrelated code. The worker will run tests after your edit."""
 
 
 def now() -> str:
@@ -456,6 +460,14 @@ def aider_command(message: str, files: list[str] | None = None) -> list[str]:
     command.extend(files or [])
     command.extend(["--message", message])
     return command
+
+
+def task_message(goal: str, failure_output: str = "") -> str:
+    message = f"{TASK_CHARTER}\n\nTask:\n{goal}"
+    if failure_output:
+        message += "\n\nThe previous attempt failed these tests; fix the exact failures:\n"
+        message += failure_output[-3000:]
+    return message
 
 
 _heartbeat_state: dict[str, object] = {"state": "init", "detail": ""}
@@ -880,9 +892,7 @@ def run_task(task: dict) -> bool:
 
         for attempt in (1, 2):
             heartbeat("task", f"{name} attempt {attempt}")
-            msg = goal if attempt == 1 else (
-                goal + "\n\nThe previous attempt failed these tests — fix the failures:\n" + test_out[-3000:]
-            )
+            msg = task_message(goal, test_out if attempt == 2 else "")
             code, out = sh(
                 aider_command(msg, goal_files(goal, repo)),
                 cwd=repo, timeout=TASK_TIMEOUT_S,
