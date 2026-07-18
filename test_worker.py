@@ -36,6 +36,14 @@ def test_goal_files_adds_existing_explicit_paths(tmp_path):
     assert cmd[-3:] == ["tests/unit/test_demo.py", "--message", "fix it"]
 
 
+def test_task_message_enforces_root_cause_charter_and_bounded_failure_tail():
+    message = worker.task_message("Fix the contract.", "x" * 4000)
+    assert "smallest root-cause change" in message
+    assert "Preserve production behavior" in message
+    assert "Task:\nFix the contract." in message
+    assert message.endswith("x" * 3000)
+
+
 def test_sapphire_regression_gate_collects_all_failures():
     command = worker.QUICK_SUITE["Sapphire"]
     assert "tests/unit" in command
