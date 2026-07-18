@@ -413,6 +413,24 @@ def test_analysis_only_task_fails_if_agent_commits(tmp_path, monkeypatch):
     assert "RESULT: FAIL" in report_lines
 
 
+def test_analysis_only_task_fails_on_new_uncommitted_path(tmp_path, monkeypatch):
+    repo = _make_run_task_mocks(monkeypatch, tmp_path)
+    snapshots = iter([(0, "?? .aider.chat.history.md\n"),
+                      (0, "?? .aider.chat.history.md\n?? src/new.py\n")])
+    monkeypatch.setattr(worker, "worktree_status", lambda p: next(snapshots))
+    task_file = tmp_path / "analysis-dirty.md"
+    task_file.write_text(f"repo: {repo}\ntest: \n---\nANALYSIS ONLY: review code.\n")
+    task = worker.parse_task(task_file)
+    reports = []
+    monkeypatch.setattr(
+        worker, "report",
+        lambda name, lines: reports.append((name, lines)) or tmp_path / "report.md",
+    )
+
+    assert worker.run_task(task) is False
+    assert "ANALYSIS-ONLY GUARD" in "\n".join(reports[-1][1])
+
+
 def test_regular_task_fails_with_zero_commits(tmp_path, monkeypatch):
     repo = _make_run_task_mocks(monkeypatch, tmp_path)
     task_file = tmp_path / "regular.md"
