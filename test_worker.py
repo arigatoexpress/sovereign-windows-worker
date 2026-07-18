@@ -211,6 +211,18 @@ def test_commits_made_zero_on_bad_repo(tmp_path):
     assert worker.commits_made(tmp_path) == 0
 
 
+def test_instance_lock_excludes_overlap_and_releases(tmp_path):
+    path = tmp_path / "worker.lock"
+    first = worker.acquire_instance_lock(path)
+    assert first is not None
+    assert worker.acquire_instance_lock(path) is None
+
+    worker.release_instance_lock(first)
+    replacement = worker.acquire_instance_lock(path)
+    assert replacement is not None
+    worker.release_instance_lock(replacement)
+
+
 def test_default_branch_detects_main(tmp_path):
     import subprocess as sp
     repo = tmp_path / "repo"

@@ -53,6 +53,7 @@ REPORTS = BASE / "reports"
 HEARTBEAT = BASE / "heartbeat.json"
 METRICS = BASE / "metrics.json"
 BASELINE_CACHE = BASE / "baseline-cache"
+INSTANCE_LOCK = BASE / "worker.lock"
 START_TIME = time.time()
 
 AIDER = Path(os.environ.get("SOV_WORKER_AIDER", HOME / ".aider-venv" / "Scripts" / "aider.exe"))
@@ -582,6 +583,48 @@ def has_worktree_changes(repo: Path) -> bool:
     return code != 0 or bool(out.strip())
 
 
+def acquire_instance_lock(path: Path = INSTANCE_LOCK):
+    """Acquire an OS-released singleton lock, returning its open handle.
+
+    Scheduled Task restarts can overlap wrappers. The lock is held by the
+    Python process and released by the OS even after a crash or forced stop.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a+b")
+    if path.stat().st_size == 0:
+        handle.write(b"0")
+        handle.flush()
+    handle.seek(0)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    handle.seek(0)
+    handle.truncate()
+    handle.write(str(os.getpid()).encode("ascii"))
+    handle.flush()
+    return handle
+
+
+def release_instance_lock(handle) -> None:
+    if handle is None or handle.closed:
+        return
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    handle.close()
+
+
 _PYTEST_FAILURE_RE = re.compile(r"^(?:FAILED|ERROR)\s+([^\s]+)", re.MULTILINE)
 
 
@@ -1081,6 +1124,10 @@ def execute_task(task: dict) -> bool:
 
 
 def main() -> None:
+    instance_lock = acquire_instance_lock()
+    if instance_lock is None:
+        print("another worker instance holds the singleton lock; exiting")
+        return
     for d in (QUEUE, PROPOSED, DONE, FAILED, REPORTS):
         d.mkdir(parents=True, exist_ok=True)
     heartbeat("start")
