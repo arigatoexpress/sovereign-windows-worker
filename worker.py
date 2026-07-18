@@ -55,8 +55,10 @@ START_TIME = time.time()
 
 AIDER = Path(os.environ.get("SOV_WORKER_AIDER", HOME / ".aider-venv" / "Scripts" / "aider.exe"))
 PYTHON = Path(os.environ.get("SOV_WORKER_PYTHON", HOME / "AppData" / "Local" / "Programs" / "Python" / "Python313" / "python.exe"))
-MODEL = "ollama/codestral:22b"          # non-thinking, FIM diff-trained, fits 16GB
-WEAK_MODEL = "ollama/gemma3:4b"
+MODEL = os.environ.get("SOV_WORKER_MODEL", "ollama/devstral:24b")
+WEAK_MODEL = os.environ.get("SOV_WORKER_WEAK_MODEL", "ollama/gemma3:4b")
+MAP_TOKENS = os.environ.get("SOV_WORKER_MAP_TOKENS", "512")
+MAX_CHAT_HISTORY_TOKENS = os.environ.get("SOV_WORKER_MAX_CHAT_TOKENS", "8192")
 
 ALLOWLIST = [
     HOME / "Code" / "Sapphire",
@@ -406,6 +408,29 @@ def sh(cmd: list[str] | str, cwd: Path | None = None, timeout: int = 600) -> tup
         return 125, f"EXEC ERROR: {e}"
 
 
+def aider_command(message: str) -> list[str]:
+    """Build the deterministic, non-interactive local Aider invocation."""
+    return [
+        str(AIDER),
+        "--model", MODEL,
+        "--weak-model", WEAK_MODEL,
+        "--no-show-model-warnings",
+        "--yes-always",
+        "--no-stream",
+        "--no-pretty",
+        "--no-fancy-input",
+        "--no-notifications",
+        "--no-check-update",
+        "--no-gitignore",
+        "--map-tokens", MAP_TOKENS,
+        "--map-multiplier-no-files", "1",
+        "--map-refresh", "manual",
+        "--max-chat-history-tokens", MAX_CHAT_HISTORY_TOKENS,
+        "--auto-commits",
+        "--message", message,
+    ]
+
+
 _heartbeat_state: dict[str, object] = {"state": "init", "detail": ""}
 
 
@@ -611,10 +636,7 @@ def _run_tho_task(task: dict) -> bool:
                 + test_out[-3000:]
             )
             code, out = sh(
-                [str(AIDER), "--model", MODEL, "--weak-model", WEAK_MODEL,
-                 "--no-show-model-warnings", "--yes-always", "--no-stream",
-                 "--map-tokens", "1024", "--map-refresh", "manual",
-                 "--auto-commits", "--message", message],
+                aider_command(message),
                 cwd=workspace, timeout=TASK_TIMEOUT_S,
             )
             lines += ["", f"## aider attempt {attempt} (rc={code})", "```", out[-2500:], "```"]
@@ -754,17 +776,14 @@ def run_task(task: dict) -> bool:
                 goal + "\n\nThe previous attempt failed these tests — fix the failures:\n" + test_out[-3000:]
             )
             code, out = sh(
-                [str(AIDER), "--model", MODEL, "--weak-model", WEAK_MODEL,
-                 "--no-show-model-warnings", "--yes-always", "--no-stream",
-                 "--map-tokens", "1024", "--map-refresh", "manual",
-                 "--auto-commits", "--message", msg],
+                aider_command(msg),
                 cwd=repo, timeout=TASK_TIMEOUT_S,
             )
             lines += ["", f"## aider attempt {attempt} (rc={code})", "```", out[-2500:], "```"]
 
             n_diff = diff_lines(repo, base)
             if n_diff > MAX_DIFF_LINES:
-                lines += [f"", f"RUNAWAY GUARD: diff is {n_diff} lines (> {MAX_DIFF_LINES}) — failing task."]
+                lines += ["", f"RUNAWAY GUARD: diff is {n_diff} lines (> {MAX_DIFF_LINES}) — failing task."]
                 break
 
             if not test:

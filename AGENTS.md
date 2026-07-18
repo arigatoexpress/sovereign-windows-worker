@@ -4,7 +4,7 @@
 Task: `sovereign-agent-worker` (S4U, boot/logon, restart×3). Code: `worker.py`. Tests: `test_worker.py` (11+ tests).
 
 ## What it does
-1. Executes `queue\*.md` tasks: aider (codestral:22b, on-box Ollama) → task tests →
+1. Executes `queue\*.md` tasks: aider (devstral:24b, on-box Ollama) → task tests →
    2-attempt failure-feedback loop → regression gate → report + git bundle in `reports\`.
 2. When idle (every 12h): regression sweep over allowlisted repos, then **backlog mining** —
    it generates its own work from repo signals:
@@ -50,3 +50,7 @@ header block ends at the first line that is exactly `---`).
 ## Environment overrides (optional)
 - `SOV_WORKER_PYTHON` — Python executable (default: `C:\Users\aribs\AppData\Local\Programs\Python\Python313\python.exe`)
 - `SOV_WORKER_AIDER` — aider executable (default: `C:\Users\aribs\.aider-venv\Scripts\aider.exe`)
+- `SOV_WORKER_MODEL` — primary coding model (default: `ollama/devstral:24b`)
+- `SOV_WORKER_WEAK_MODEL` — weak model (default: `ollama/gemma3:4b`)
+- `SOV_WORKER_MAP_TOKENS` — bounded repo-map budget (default: `512`)
+- `SOV_WORKER_MAX_CHAT_TOKENS` — bounded Aider chat history (default: `8192`)
