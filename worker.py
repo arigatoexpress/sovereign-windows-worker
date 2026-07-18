@@ -411,9 +411,24 @@ def sh(cmd: list[str] | str, cwd: Path | None = None, timeout: int = 600) -> tup
         return 125, f"EXEC ERROR: {e}"
 
 
-def aider_command(message: str) -> list[str]:
+def goal_files(goal: str, repo: Path) -> list[str]:
+    """Return existing repo-relative files explicitly named in a task goal."""
+    seen: set[str] = set()
+    files: list[str] = []
+    for raw in re.findall(r"(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]+(?:[/\\][A-Za-z0-9_.-]+)+)", goal):
+        relative = raw.replace("\\", "/").split("::", 1)[0].rstrip(".,:;)")
+        if relative in seen or not (repo / relative).is_file():
+            continue
+        seen.add(relative)
+        files.append(relative)
+        if len(files) == 8:
+            break
+    return files
+
+
+def aider_command(message: str, files: list[str] | None = None) -> list[str]:
     """Build the deterministic, non-interactive local Aider invocation."""
-    return [
+    command = [
         str(AIDER),
         "--model", MODEL,
         "--weak-model", WEAK_MODEL,
@@ -430,8 +445,10 @@ def aider_command(message: str) -> list[str]:
         "--map-refresh", "manual",
         "--max-chat-history-tokens", MAX_CHAT_HISTORY_TOKENS,
         "--auto-commits",
-        "--message", message,
     ]
+    command.extend(files or [])
+    command.extend(["--message", message])
+    return command
 
 
 _heartbeat_state: dict[str, object] = {"state": "init", "detail": ""}
@@ -639,7 +656,7 @@ def _run_tho_task(task: dict) -> bool:
                 + test_out[-3000:]
             )
             code, out = sh(
-                aider_command(message),
+                aider_command(message, goal_files(goal, workspace)),
                 cwd=workspace, timeout=TASK_TIMEOUT_S,
             )
             lines += ["", f"## aider attempt {attempt} (rc={code})", "```", out[-2500:], "```"]
@@ -779,7 +796,7 @@ def run_task(task: dict) -> bool:
                 goal + "\n\nThe previous attempt failed these tests — fix the failures:\n" + test_out[-3000:]
             )
             code, out = sh(
-                aider_command(msg),
+                aider_command(msg, goal_files(goal, repo)),
                 cwd=repo, timeout=TASK_TIMEOUT_S,
             )
             lines += ["", f"## aider attempt {attempt} (rc={code})", "```", out[-2500:], "```"]
