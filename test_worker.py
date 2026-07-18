@@ -16,6 +16,7 @@ def test_aider_command_is_bounded_and_noninteractive():
     assert cmd[cmd.index("--model") + 1] == worker.MODEL
     assert cmd[cmd.index("--map-tokens") + 1] == "512"
     assert cmd[cmd.index("--max-chat-history-tokens") + 1] == "8192"
+    assert cmd[cmd.index("--edit-format") + 1] == "diff"
     assert "--no-fancy-input" in cmd
     assert "--no-gitignore" in cmd
     assert cmd[-2:] == ["--message", "fix the test"]

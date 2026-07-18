@@ -59,6 +59,7 @@ MODEL = os.environ.get("SOV_WORKER_MODEL", "ollama/devstral:24b")
 WEAK_MODEL = os.environ.get("SOV_WORKER_WEAK_MODEL", "ollama/gemma3:4b")
 MAP_TOKENS = os.environ.get("SOV_WORKER_MAP_TOKENS", "512")
 MAX_CHAT_HISTORY_TOKENS = os.environ.get("SOV_WORKER_MAX_CHAT_TOKENS", "8192")
+EDIT_FORMAT = os.environ.get("SOV_WORKER_EDIT_FORMAT", "diff")
 
 ALLOWLIST = [
     HOME / "Code" / "Sapphire",
@@ -432,6 +433,7 @@ def aider_command(message: str, files: list[str] | None = None) -> list[str]:
         str(AIDER),
         "--model", MODEL,
         "--weak-model", WEAK_MODEL,
+        "--edit-format", EDIT_FORMAT,
         "--no-show-model-warnings",
         "--yes-always",
         "--no-stream",
