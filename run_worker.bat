@@ -1,6 +1,8 @@
 @echo off
 rem sovereign windows worker — restart-forever wrapper with log rotation.
 cd /d C:\Users\aribs\agent-worker
+set SOV_WORKER_MODEL=ollama/devstral:24b
+set SOV_WORKER_WEAK_MODEL=ollama/gemma3:4b
 
 rem Rotate worker.log if it exceeds ~100 MB.
 for %%F in (worker.log) do (
@@ -10,7 +12,7 @@ for %%F in (worker.log) do (
 )
 
 :loop
-echo [%date% %time%] worker starting >> worker.log
+echo [%date% %time%] worker starting model=%SOV_WORKER_MODEL% >> worker.log
 C:\Users\aribs\AppData\Local\Programs\Python\Python313\python.exe worker.py >> worker.log 2>&1
 echo [%date% %time%] worker exited rc=%errorlevel% — restarting in 30s >> worker.log
 timeout /t 30 /nobreak > nul

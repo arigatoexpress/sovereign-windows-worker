@@ -10,6 +10,17 @@ sys.path.insert(0, str(Path(__file__).parent))
 import worker
 
 
+def test_aider_command_is_bounded_and_noninteractive():
+    cmd = worker.aider_command("fix the test")
+    assert cmd[0] == str(worker.AIDER)
+    assert cmd[cmd.index("--model") + 1] == worker.MODEL
+    assert cmd[cmd.index("--map-tokens") + 1] == "512"
+    assert cmd[cmd.index("--max-chat-history-tokens") + 1] == "8192"
+    assert "--no-fancy-input" in cmd
+    assert "--no-gitignore" in cmd
+    assert cmd[-2:] == ["--message", "fix the test"]
+
+
 def _git(repo, *args):
     return sp.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True)
 
